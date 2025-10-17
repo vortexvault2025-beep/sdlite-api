@@ -15,6 +15,7 @@ concurrency:
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       # --- Checkout & build (runner only) ---
@@ -26,8 +27,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: "20"
+          cache: "npm"
 
       - name: Install deps
         run: npm ci
@@ -42,20 +43,27 @@ jobs:
           test -n "${{ secrets.VPS_USER }}" && echo "VPS_USER=OK" || echo "VPS_USER=MISSING"
           test -n "${{ secrets.VPS_PATH }}" && echo "VPS_PATH=OK" || echo "VPS_PATH=MISSING"
           if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then echo "VPS_SSH_KEY=OK"; else echo "VPS_SSH_KEY=MISSING"; fi
+          test -n "${{ secrets.PM2_NAME }}" && echo "PM2_NAME=OK" || echo "PM2_NAME=MISSING"
           test -n "${{ secrets.X_API_KEY }}" && echo "X_API_KEY=OK" || echo "X_API_KEY=MISSING"
-          if [ -n "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "SUPABASE_DB_URL=OK"; else echo "SUPABASE_DB_URL=MISSING (routing gate will be skipped)"; fi
+          if [ -n "${{ vars.API_HOST }}" ] || [ -n "${{ secrets.API_HOST }}" ] || [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            echo "API_BASE/HOST present"
+          else
+            echo "API_BASE/HOST MISSING"; exit 1
+          fi
+          if [ -n "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "SUPABASE_DB_URL=OK"; else echo "SUPABASE_DB_URL=NOT SET (routing gate will auto-skip)"; fi
 
-      # --- Resolve public API base with safe fallbacks ---
+      # --- Resolve public API base with safe fallbacks (prefers vars for visible host) ---
       - name: Resolve API base URL (vars → secrets → base_url)
+        id: resolve-url
         run: |
           if [ -n "${{ vars.API_HOST }}" ]; then
-            echo "URL_BASE=https://${{ vars.API_HOST }}" >> $GITHUB_ENV
+            echo "URL_BASE=https://${{ vars.API_HOST }}" >> "$GITHUB_ENV"
             echo "Resolved via vars.API_HOST"
           elif [ -n "${{ secrets.API_HOST }}" ]; then
-            echo "URL_BASE=https://${{ secrets.API_HOST }}" >> $GITHUB_ENV
+            echo "URL_BASE=https://${{ secrets.API_HOST }}" >> "$GITHUB_ENV"
             echo "Resolved via secrets.API_HOST (masked)"
           elif [ -n "${{ secrets.API_BASE_URL }}" ]; then
-            echo "URL_BASE=${{ secrets.API_BASE_URL }}" >> $GITHUB_ENV
+            echo "URL_BASE=${{ secrets.API_BASE_URL }}" >> "$GITHUB_ENV"
             echo "Resolved via secrets.API_BASE_URL (masked)"
           else
             echo "No API host/base configured"; exit 1
@@ -83,6 +91,7 @@ jobs:
             set -euo pipefail
             cd "${{ secrets.VPS_PATH }}"
             NODE_ENV=production npm ci --omit=dev
+            # Restart (or start) the API; keep name consistent with your PM2 process
             sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
@@ -103,9 +112,9 @@ jobs:
               --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A6","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
               -D a6.headers -o a6.bin -w "\nHTTP=%{http_code}\n" && break || sleep 1
           done
-          grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a6.headers || (echo "A6: non-200"; sed -n '1,80p' a6.headers; exit 1)
-          grep -qi '^content-type: *application/pdf' a6.headers || (echo "A6: wrong Content-Type"; sed -n '1,80p' a6.headers; exit 1)
-          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a6.headers || (echo "A6: wrong Content-Disposition"; sed -n '1,80p' a6.headers; exit 1)
+          grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a6.headers || (echo "A6: non-200"; sed -n '1,120p' a6.headers; exit 1)
+          grep -qi '^content-type: *application/pdf' a6.headers || (echo "A6: wrong Content-Type"; sed -n '1,120p' a6.headers; exit 1)
+          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a6.headers || (echo "A6: wrong Content-Disposition"; sed -n '1,120p' a6.headers; exit 1)
           head -c 5 a6.bin | grep -q "%PDF-" || (echo "A6: not real PDF"; head -c 64 a6.bin | hexdump -C; exit 1)
           echo "A6 OK"
 
@@ -121,23 +130,28 @@ jobs:
               --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A4","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
               -D a4.headers -o a4.bin -w "\nHTTP=%{http_code}\n" && break || sleep 1
           done
-          grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a4.headers || (echo "A4: non-200"; sed -n '1,80p' a4.headers; exit 1)
-          grep -qi '^content-type: *application/pdf' a4.headers || (echo "A4: wrong Content-Type"; sed -n '1,80p' a4.headers; exit 1)
-          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a4.headers || (echo "A4: wrong Content-Disposition"; sed -n '1,80p' a4.headers; exit 1)
+          grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a4.headers || (echo "A4: non-200"; sed -n '1,120p' a4.headers; exit 1)
+          grep -qi '^content-type: *application/pdf' a4.headers || (echo "A4: wrong Content-Type"; sed -n '1,120p' a4.headers; exit 1)
+          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a4.headers || (echo "A4: wrong Content-Disposition"; sed -n '1,120p' a4.headers; exit 1)
           head -c 5 a4.bin | grep -q "%PDF-" || (echo "A4: not real PDF"; head -c 64 a4.bin | hexdump -C; exit 1)
           echo "A4 OK"
 
-      # --- Routing integrity gate (optional until DB wired) ---
+      # --- Routing integrity gate (auto-skip if DB secret not set) ---
       - name: Routing integrity (no null tiles)
-        if: ${{ secrets.SUPABASE_DB_URL != '' }}
         run: |
           set -euo pipefail
+          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
+            echo "Skipping routing integrity: SUPABASE_DB_URL not set."
+            exit 0
+          fi
+          echo "Checking routing integrity..."
           sudo apt-get update -y >/dev/null && sudo apt-get install -y postgresql-client >/dev/null
           COUNT=$(psql "${{ secrets.SUPABASE_DB_URL }}" -Atc \
             "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
           echo "Null tile rows: $COUNT"
           [ "$COUNT" -eq 0 ] || (echo "Routing holes exist. Import mappings before deploy."; exit 1)
 
+      # --- Preserve artifacts on failure for debugging ---
       - name: Upload smoke artifacts (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
