@@ -1,0 +1,71 @@
+name: Deploy API
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build (non-blocking)
+        run: npm run build || true
+
+      - name: Upload to VPS
+        uses: easingthemes/ssh-deploy@v5.1.0
+        with:
+          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
+          REMOTE_HOST: ${{ secrets.VPS_HOST }}
+          REMOTE_USER: ${{ secrets.VPS_USER }}
+          TARGET: ${{ secrets.VPS_PATH }}
+          ARGS: "-az --delete"
+          EXCLUDE: ".git,.github,node_modules,*.log"
+
+      - name: Install prod deps & restart pm2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            cd ${{ secrets.VPS_PATH }}
+            NODE_ENV=production npm ci --omit=dev
+            sudo pm2 restart ${{ secrets.PM2_NAME }} --update-env || sudo pm2 start "node src/server.js" --name ${{ secrets.PM2_NAME }}
+            sudo pm2 save || true
+
+      # ---- Smokes: ensure real PDFs (%PDF-) ----
+      - name: Smoke A6 (%PDF-)
+        run: |
+          curl -s -X POST "${{ secrets.API_BASE_URL }}/api/labels/render-a6?save=0" \
+            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" -H 'Content-Type: application/json' \
+            --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A6","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
+            -o out-a6.pdf
+          head -c 5 out-a6.pdf | grep -q "%PDF-" || (echo "A6 smoke failed"; exit 1)
+
+      - name: Smoke A4 4-up (%PDF-)
+        run: |
+          curl -s -X POST "${{ secrets.API_BASE_URL }}/api/labels/render-a4-4up?count=1&save=0" \
+            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" -H 'Content-Type: application/json' \
+            --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A4","tiles":{"left":"X","right":"Y"},"recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
+            -o out-a4.pdf
+          head -c 5 out-a4.pdf | grep -q "%PDF-" || (echo "A4 smoke failed"; exit 1)
+
+      - name: Routing integrity (no null tiles)
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          COUNT=$(psql "${{ secrets.SUPABASE_DB_URL }}" -Atc "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
+          echo "Null tile rows: $COUNT"
+          [ "$COUNT" -eq 0 ] || (echo "Routing holes exist. Import mappings before deploy."; exit 1)
