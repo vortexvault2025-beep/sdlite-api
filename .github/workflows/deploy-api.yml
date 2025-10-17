@@ -5,6 +5,14 @@ on:
     branches: [ main ]
   workflow_dispatch: {}
 
+# safer defaults
+permissions:
+  contents: read
+
+concurrency:
+  group: api-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
@@ -12,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -24,6 +34,16 @@ jobs:
 
       - name: Build (non-blocking)
         run: npm run build || true
+
+      # quick sanity so we don't chase ghosts
+      - name: Debug inputs (no secrets printed)
+        run: |
+          test -n "${{ secrets.VPS_HOST }}" && echo "VPS_HOST=OK" || echo "VPS_HOST=MISSING"
+          test -n "${{ secrets.VPS_USER }}" && echo "VPS_USER=OK" || echo "VPS_USER=MISSING"
+          test -n "${{ secrets.VPS_PATH }}" && echo "VPS_PATH=OK" || echo "VPS_PATH=MISSING"
+          if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then echo "VPS_SSH_KEY=OK"; else echo "VPS_SSH_KEY=MISSING"; fi
+          test -n "${{ secrets.API_BASE_URL }}" && echo "API_BASE_URL=OK" || echo "API_BASE_URL=MISSING"
+          test -n "${{ secrets.X_API_KEY }}" && echo "X_API_KEY=OK" || echo "X_API_KEY=MISSING"
 
       - name: Upload to VPS
         uses: easingthemes/ssh-deploy@v5.1.0
@@ -48,22 +68,48 @@ jobs:
             sudo pm2 restart ${{ secrets.PM2_NAME }} --update-env || sudo pm2 start "node src/server.js" --name ${{ secrets.PM2_NAME }}
             sudo pm2 save || true
 
-      # ---- Smokes: ensure real PDFs (%PDF-) ----
-      - name: Smoke A6 (%PDF-)
+      # ---------- Smokes: only pass if bytes are real PDFs ----------
+      - name: Smoke A6 (verbose on failure)
+        shell: bash
         run: |
-          curl -s -X POST "${{ secrets.API_BASE_URL }}/api/labels/render-a6?save=0" \
-            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" -H 'Content-Type: application/json' \
+          set -euo pipefail
+          URL="${{ secrets.API_BASE_URL }}/api/labels/render-a6?save=0"
+          echo "→ POST $URL"
+          curl -sS -X POST "$URL" \
+            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
+            -H "Content-Type: application/json" \
             --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A6","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
-            -o out-a6.pdf
-          head -c 5 out-a6.pdf | grep -q "%PDF-" || (echo "A6 smoke failed"; exit 1)
+            -D a6.headers -o a6.bin -w "\nHTTP=%{http_code}\n" || true
 
-      - name: Smoke A4 4-up (%PDF-)
+          if head -c 5 a6.bin | grep -q "%PDF-"; then
+            echo "A6 smoke OK: %PDF- detected"
+          else
+            echo "A6 smoke failed."
+            echo "----- A6 HEADERS -----"; sed -n '1,120p' a6.headers || true
+            echo "----- A6 MAGIC -----"; head -c 64 a6.bin | hexdump -C || true
+            exit 1
+          fi
+
+      - name: Smoke A4 4-up (verbose on failure)
+        shell: bash
         run: |
-          curl -s -X POST "${{ secrets.API_BASE_URL }}/api/labels/render-a4-4up?count=1&save=0" \
-            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" -H 'Content-Type: application/json' \
+          set -euo pipefail
+          URL="${{ secrets.API_BASE_URL }}/api/labels/render-a4-4up?count=1&save=0"
+          echo "→ POST $URL"
+          curl -sS -X POST "$URL" \
+            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
+            -H "Content-Type: application/json" \
             --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A4","tiles":{"left":"X","right":"Y"},"recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
-            -o out-a4.pdf
-          head -c 5 out-a4.pdf | grep -q "%PDF-" || (echo "A4 smoke failed"; exit 1)
+            -D a4.headers -o a4.bin -w "\nHTTP=%{http_code}\n" || true
+
+          if head -c 5 a4.bin | grep -q "%PDF-"; then
+            echo "A4 smoke OK: %PDF- detected"
+          else
+            echo "A4 smoke failed."
+            echo "----- A4 HEADERS -----"; sed -n '1,120p' a4.headers || true
+            echo "----- A4 MAGIC -----"; head -c 64 a4.bin | hexdump -C || true
+            exit 1
+          fi
 
       - name: Routing integrity (no null tiles)
         run: |
