@@ -1,0 +1,13 @@
+node_modules
+.env
+.DS_Store
+tmp/
+*.log
+# secrets / env
+.env
+.env.*
+# archives & local packs
+*.zip
+*.tar
+# local backups
+backup/

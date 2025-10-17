@@ -1,0 +1,20 @@
+{
+  "name": "sdlite-api",
+  "version": "0.3.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "adm-zip": "^0.5.10",
+    "busboy": "^1.6.0",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^17.2.3",
+    "express": "^4.19.2",
+    "pdfkit": "^0.13.0",
+    "xlsx": "^0.18.5"
+  }
+}

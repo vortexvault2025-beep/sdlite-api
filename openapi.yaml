@@ -1,0 +1,70 @@
+openapi: 3.0.3
+info:
+  title: SD‑Lite API
+  version: 0.2.0
+paths:
+  /api/labels/render-a6:
+    post:
+      summary: Render A6 label
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/A6Payload'
+      responses:
+        "200":
+          description: PDF bytes
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+  /api/labels/render-a4-4up:
+    post:
+      summary: Render A4 4‑up (reuses A6)
+      parameters:
+        - in: query
+          name: count
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 4, default: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/A6Payload'
+      responses:
+        "200":
+          description: PDF bytes
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+components:
+  schemas:
+    A6Payload:
+      type: object
+      required: [variant, orderId]
+      properties:
+        variant:
+          type: string
+          enum: [a6_sd_1pm_v1, a6_trk24_nosig_v1]
+        orderId: { type: string }
+        tiles:
+          type: object
+          properties:
+            left: { type: string }
+            right: { type: string }
+        recipient:
+          type: object
+          properties:
+            lines:
+              type: array
+              items: { type: string }
+        top_ref_text: { type: string }
+        mid_ref_text: { type: string }
+        customer_ref: { type: string }
+        price_text: { type: string }
+        post_by_date: { type: string }
