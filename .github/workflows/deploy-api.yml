@@ -1,3 +1,8 @@
+──────────────────────────────────────────────
+# .github/workflows/deploy-api.yml
+# SD-Lite API – Production Deployment + CI Smokes
+# ✅ Stable for prod: PDF headers, %PDF- magic, routing gate
+
 name: Deploy API
 
 on:
@@ -5,7 +10,6 @@ on:
     branches: [ main ]
   workflow_dispatch: {}
 
-# safer defaults
 permissions:
   contents: read
 
@@ -18,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # --- Checkout & build (runner only) ---
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -35,16 +40,33 @@ jobs:
       - name: Build (non-blocking)
         run: npm run build || true
 
-      # quick sanity so we don't chase ghosts
+      # --- Sanity: ensure required secrets/vars exist (no values printed) ---
       - name: Debug inputs (no secrets printed)
         run: |
           test -n "${{ secrets.VPS_HOST }}" && echo "VPS_HOST=OK" || echo "VPS_HOST=MISSING"
           test -n "${{ secrets.VPS_USER }}" && echo "VPS_USER=OK" || echo "VPS_USER=MISSING"
           test -n "${{ secrets.VPS_PATH }}" && echo "VPS_PATH=OK" || echo "VPS_PATH=MISSING"
           if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then echo "VPS_SSH_KEY=OK"; else echo "VPS_SSH_KEY=MISSING"; fi
-          test -n "${{ secrets.API_BASE_URL }}" && echo "API_BASE_URL=OK" || echo "API_BASE_URL=MISSING"
           test -n "${{ secrets.X_API_KEY }}" && echo "X_API_KEY=OK" || echo "X_API_KEY=MISSING"
+          if [ -n "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "SUPABASE_DB_URL=OK"; else echo "SUPABASE_DB_URL=MISSING (routing gate will be skipped)"; fi
 
+      # --- Resolve public API base with safe fallbacks ---
+      - name: Resolve API base URL (vars → secrets → base_url)
+        run: |
+          if [ -n "${{ vars.API_HOST }}" ]; then
+            echo "URL_BASE=https://${{ vars.API_HOST }}" >> $GITHUB_ENV
+            echo "Resolved via vars.API_HOST"
+          elif [ -n "${{ secrets.API_HOST }}" ]; then
+            echo "URL_BASE=https://${{ secrets.API_HOST }}" >> $GITHUB_ENV
+            echo "Resolved via secrets.API_HOST (masked)"
+          elif [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            echo "URL_BASE=${{ secrets.API_BASE_URL }}" >> $GITHUB_ENV
+            echo "Resolved via secrets.API_BASE_URL (masked)"
+          else
+            echo "No API host/base configured"; exit 1
+          fi
+
+      # --- Ship code to VPS ---
       - name: Upload to VPS
         uses: easingthemes/ssh-deploy@v5.1.0
         with:
@@ -61,59 +83,75 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
           script: |
-            set -e
-            cd ${{ secrets.VPS_PATH }}
+            set -euo pipefail
+            cd "${{ secrets.VPS_PATH }}"
             NODE_ENV=production npm ci --omit=dev
-            sudo pm2 restart ${{ secrets.PM2_NAME }} --update-env || sudo pm2 start "node src/server.js" --name ${{ secrets.PM2_NAME }}
+            sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
+            sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
 
-      # ---------- Smokes: only pass if bytes are real PDFs ----------
-      - name: Smoke A6 (verbose on failure)
-        shell: bash
+      - name: Warm-up wait
+        run: sleep 2
+
+      # --- Smokes: assert REAL PDFs (status+headers+magic) ---
+      - name: Smoke A6 (strict PDF checks, retry x3)
         run: |
           set -euo pipefail
-          URL="${{ secrets.API_BASE_URL }}/api/labels/render-a6?save=0"
+          URL="$URL_BASE/api/labels/render-a6?save=0"
           echo "→ POST $URL"
-          curl -sS -X POST "$URL" \
-            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A6","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
-            -D a6.headers -o a6.bin -w "\nHTTP=%{http_code}\n" || true
+          for i in 1 2 3; do
+            curl -sS -X POST "$URL" \
+              -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A6","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
+              -D a6.headers -o a6.bin -w "\nHTTP=%{http_code}\n" && break || sleep 1
+          done
+          grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a6.headers || (echo "A6: non-200"; sed -n '1,80p' a6.headers; exit 1)
+          grep -qi '^content-type: *application/pdf' a6.headers || (echo "A6: wrong Content-Type"; sed -n '1,80p' a6.headers; exit 1)
+          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a6.headers || (echo "A6: wrong Content-Disposition"; sed -n '1,80p' a6.headers; exit 1)
+          head -c 5 a6.bin | grep -q "%PDF-" || (echo "A6: not real PDF"; head -c 64 a6.bin | hexdump -C; exit 1)
+          echo "A6 OK"
 
-          if head -c 5 a6.bin | grep -q "%PDF-"; then
-            echo "A6 smoke OK: %PDF- detected"
-          else
-            echo "A6 smoke failed."
-            echo "----- A6 HEADERS -----"; sed -n '1,120p' a6.headers || true
-            echo "----- A6 MAGIC -----"; head -c 64 a6.bin | hexdump -C || true
-            exit 1
-          fi
-
-      - name: Smoke A4 4-up (verbose on failure)
-        shell: bash
+      - name: Smoke A4 4-up (strict PDF checks, retry x3)
         run: |
           set -euo pipefail
-          URL="${{ secrets.API_BASE_URL }}/api/labels/render-a4-4up?count=1&save=0"
+          URL="$URL_BASE/api/labels/render-a4-4up?count=1&save=0"
           echo "→ POST $URL"
-          curl -sS -X POST "$URL" \
-            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A4","tiles":{"left":"X","right":"Y"},"recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
-            -D a4.headers -o a4.bin -w "\nHTTP=%{http_code}\n" || true
+          for i in 1 2 3; do
+            curl -sS -X POST "$URL" \
+              -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A4","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
+              -D a4.headers -o a4.bin -w "\nHTTP=%{http_code}\n" && break || sleep 1
+          done
+          grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a4.headers || (echo "A4: non-200"; sed -n '1,80p' a4.headers; exit 1)
+          grep -qi '^content-type: *application/pdf' a4.headers || (echo "A4: wrong Content-Type"; sed -n '1,80p' a4.headers; exit 1)
+          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a4.headers || (echo "A4: wrong Content-Disposition"; sed -n '1,80p' a4.headers; exit 1)
+          head -c 5 a4.bin | grep -q "%PDF-" || (echo "A4: not real PDF"; head -c 64 a4.bin | hexdump -C; exit 1)
+          echo "A4 OK"
 
-          if head -c 5 a4.bin | grep -q "%PDF-"; then
-            echo "A4 smoke OK: %PDF- detected"
-          else
-            echo "A4 smoke failed."
-            echo "----- A4 HEADERS -----"; sed -n '1,120p' a4.headers || true
-            echo "----- A4 MAGIC -----"; head -c 64 a4.bin | hexdump -C || true
-            exit 1
-          fi
-
+      # --- Routing integrity gate (optional until DB wired) ---
       - name: Routing integrity (no null tiles)
+        if: ${{ secrets.SUPABASE_DB_URL != '' }}
         run: |
-          sudo apt-get update && sudo apt-get install -y postgresql-client
-          COUNT=$(psql "${{ secrets.SUPABASE_DB_URL }}" -Atc "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
+          set -euo pipefail
+          sudo apt-get update -y >/dev/null && sudo apt-get install -y postgresql-client >/dev/null
+          COUNT=$(psql "${{ secrets.SUPABASE_DB_URL }}" -Atc \
+            "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
           echo "Null tile rows: $COUNT"
           [ "$COUNT" -eq 0 ] || (echo "Routing holes exist. Import mappings before deploy."; exit 1)
+
+      - name: Upload smoke artifacts (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts
+          path: |
+            a6.headers
+            a6.bin
+            a4.headers
+            a4.bin
+          if-no-files-found: ignore
+──────────────────────────────────────────────
