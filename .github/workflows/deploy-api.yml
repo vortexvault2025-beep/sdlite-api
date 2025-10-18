@@ -93,16 +93,25 @@ jobs:
           script: |
             set -euo pipefail
             cd "${{ secrets.VPS_PATH }}"
-            # ensure directory is owned by the deploy user (avoids npm EACCES)
-            sudo chown -R "${{ secrets.VPS_USER }}":"${{ secrets.VPS_USER }}" .
-            # purge any stale modules created by root from old runs
-            if [ -d node_modules ]; then sudo rm -rf node_modules; fi
+
+            # Preflight: directory must be writable by deploy user (no sudo prompt)
+            ( touch .ci_write_test && rm .ci_write_test ) || {
+              echo "ERR: ${USER} cannot write to $PWD"
+              echo "One-time fix on VPS: sudo chown -R ${USER}:${USER} ${PWD}"
+              exit 1
+            }
+
+            # Remove stale modules IF we own them (no sudo here)
+            [ -d node_modules ] && rm -rf node_modules || true
+
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
+
+            # pm2 is allowed via sudoers (NOPASSWD)
             sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
 
-      # Warm-up poll to avoid hitting app before it’s ready
+      # Warm-up poll to avoid hitting app before it’s ready (reduces flake)
       - name: Warm-up poll
         run: |
           set -euo pipefail
