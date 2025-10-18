@@ -1,4 +1,4 @@
-
+[![Deploy API](https://github.com/vortexvault2025-beep/sdlite-api/actions/workflows/deploy-api.yml/badge.svg)](https://github.com/vortexvault2025-beep/sdlite-api/actions/workflows/deploy-api.yml)
 
 ## DataPack Importer
 Endpoint: `POST /api/data-packs/upload` — Accepts `.xlsx` (sheets per table) or `.zip` (CSV per table).
