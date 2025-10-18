@@ -1,6 +1,6 @@
 # .github/workflows/deploy-api.yml
-# SD-Lite API — Deploy + PDF smokes + Routing gate (IPv4-safe)
-# Robust DB URL handling: validates, auto-normalizes, forces TLS, zero secret leakage.
+# SD-Lite API — Deploy + PDF smokes + Routing gate
+# Robust DB handling: normalize URL, force TLS via env, no PGHOSTADDR.
 
 name: Deploy API
 
@@ -138,7 +138,7 @@ jobs:
           head -c 5 a4.bin | grep -q "%PDF-" || (echo "A4: not real PDF"; head -c 64 a4.bin | hexdump -C; exit 1)
           echo "A4 OK"
 
-      # --- Validate DB URL shape (warn only) & normalize for psql ---
+      # --- Validate & normalize DB URL (warn only) ---
       - name: Validate & normalize SUPABASE_DB_URL (no leaks)
         id: dbnorm
         run: |
@@ -152,7 +152,7 @@ jobs:
           RAW="${{ secrets.SUPABASE_DB_URL }}"
           RAW=$(echo "$RAW" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
 
-          # Split URL without leaking secrets
+          # Pull host/user/port for warnings (never echo full URL)
           CREDS_HOST=$(echo "$RAW" | awk -F'://' '{print $2}')
           CREDS=$(echo "$CREDS_HOST" | awk -F'@' '{print $1}')
           HOSTPORTPATHQS=$(echo "$CREDS_HOST" | awk -F'@' '{print $2}')
@@ -160,12 +160,10 @@ jobs:
           HOST=$(echo "$HOSTPORTPATHQS" | awk -F'[:/]' '{print $1}')
           PORT=$(echo "$HOSTPORTPATHQS" | awk -F'[:/]' '{print $2}')
           PORT=${PORT:-5432}
-          QS=$(echo "$RAW" | awk -F'\\?' 'NF>1{print $2}')
 
           echo "DB host (masked): $HOST"
           echo "DB port: $PORT"
 
-          # Warns (won't fail deploy)
           if [ "$PORT" != "5432" ]; then
             echo "::warning title=DB Port::Expected port 5432 for CI; detected $PORT"
           fi
@@ -190,14 +188,12 @@ jobs:
             echo "::warning title=sslmode::Invalid sslmode value \"require\" detected; will normalize."
           fi
 
-          # --- Normalize: drop querystring entirely; psql will use env PGSSLMODE=require ---
+          # Normalize: drop querystring; enforce TLS via env later
           CLEAN=$(echo "$RAW" | awk -F'\\?' '{print $1}')
-          echo "::notice title=DB URL::Using normalized DB URL (query params stripped)."
-          # Export to both outputs and env for following steps
           echo "db_url_clean=$CLEAN" >> "$GITHUB_OUTPUT"
           echo "DB_URL_CLEAN=$CLEAN"  >> "$GITHUB_ENV"
 
-      # --- Routing integrity gate (IPv4-safe; auto-skip if secret not set) ---
+      # --- Routing integrity gate (no PGHOSTADDR; force TLS via env) ---
       - name: Routing integrity (no null tiles)
         if: steps.dbnorm.outputs.no_db != '1'
         run: |
@@ -205,24 +201,11 @@ jobs:
 
           echo "Checking routing integrity..."
           sudo apt-get update -y >/dev/null
-          sudo apt-get install -y postgresql-client dnsutils >/dev/null
+          sudo apt-get install -y postgresql-client >/dev/null
 
-          # Force TLS regardless of URL; we stripped sslmode from URL
+          # Force TLS; don't set PGHOSTADDR (pooler on 5432 already IPv4)
           export PGSSLMODE=require
           export PGCONNECT_TIMEOUT=10
-
-          # Prefer IPv4 (some runners lack IPv6 egress)
-          HOST=$(echo "$DB_URL_CLEAN" | awk -F'@' '{print $2}' | awk -F'[:/]' '{print $1}')
-          IPV4=$(dig +short A "$HOST" 2>/dev/null | head -n1 || true)
-          if [ -z "$IPV4" ]; then
-            IPV4=$(getent ahostsv4 "$HOST" | awk '{print $1; exit}' || true)
-          fi
-          if [ -n "$IPV4" ]; then
-            echo "Using IPv4 route for DB (address masked)."
-            export PGHOSTADDR="$IPV4"
-          else
-            echo "IPv4 not found; proceeding without PGHOSTADDR."
-          fi
 
           # Probe connectivity with normalized URL
           if ! psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null 2>psql.err; then
