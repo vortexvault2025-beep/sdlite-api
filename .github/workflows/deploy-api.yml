@@ -36,7 +36,7 @@ jobs:
       - name: Build (non-blocking)
         run: npm run build || true
 
-      # --- Sanity: ensure inputs exist (no values printed) ---
+      # --- Sanity: ensure inputs (no values printed) ---
       - name: Debug inputs (no secrets printed)
         run: |
           test -n "${{ secrets.VPS_HOST }}" && echo "VPS_HOST=OK" || echo "VPS_HOST=MISSING"
@@ -134,6 +134,24 @@ jobs:
           head -c 5 a4.bin | grep -q "%PDF-" || (echo "A4: not real PDF"; head -c 64 a4.bin | hexdump -C; exit 1)
           echo "A4 OK"
 
+      # --- Validate pooler URL shape (prevents “Tenant or user not found”) ---
+      - name: Validate SUPABASE_DB_URL shape (no leaks)
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
+            echo "Skipping: SUPABASE_DB_URL not set."
+            exit 0
+          fi
+          URL='${{ secrets.SUPABASE_DB_URL }}'
+          USER=$(printf '%s' "$URL" | sed -E 's|^[a-z]+://([^:]+):.*|\\1|')
+          case "$USER" in
+            postgres.*) echo "User OK (includes project ref)";;
+            *)
+              echo "Bad DB URL: username must be postgres.<PROJECT_REF> for pooler. Fix in GitHub Secrets."
+              exit 1;;
+          esac
+          echo "$URL" | grep -q 'sslmode=require' || { echo "Bad DB URL: append ?sslmode=require"; exit 1; }
+
       # --- Routing integrity gate (IPv4-safe; auto-skip if secret not set) ---
       - name: Routing integrity (no null tiles)
         run: |
@@ -149,9 +167,9 @@ jobs:
           sudo apt-get install -y postgresql-client dnsutils >/dev/null
 
           export PGCONNECT_TIMEOUT=10
-          export PGSSLMODE=require   # TLS for Direct or Pooler (append ?sslmode=require in the URL too)
+          export PGSSLMODE=require
 
-          # Extract hostname from the URL (do NOT echo the URL)
+          # Extract hostname only (never echo full URL)
           HOST=$(printf '%s' "${{ secrets.SUPABASE_DB_URL }}" | sed -E 's|^[a-z]+://[^@]+@([^:/?]+).*|\\1|')
 
           # Prefer IPv4 (some runners lack IPv6 egress)
@@ -166,7 +184,7 @@ jobs:
             echo "IPv4 not found; proceeding without PGHOSTADDR."
           fi
 
-          # Probe connectivity explicitly so failures aren’t cryptic
+          # Probe connectivity explicitly
           if ! psql "${{ secrets.SUPABASE_DB_URL }}" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null 2>psql.err; then
             echo "❌ Could not connect to Supabase (stderr follows):"
             sed -n '1,200p' psql.err || true
