@@ -1,6 +1,6 @@
 # .github/workflows/deploy-api.yml
 # SD-Lite API — Deploy + PDF smokes + Audit verify + Routing gate
-# Per-release deploy (blue/green) to avoid EACCES on node_modules.
+# Per-release deploy to avoid EACCES on node_modules; warm-up poll; DB URL normalize.
 
 name: Deploy API
 
@@ -72,17 +72,44 @@ jobs:
             echo "No API host/base configured"; exit 1
           fi
 
-      # --- Ship code to a NEW release path on VPS ---
+      # --- Prepare release dir on VPS (idempotent) ---
+      - name: Prepare release dir on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
+          envs: GITHUB_SHA
+          script: |
+            set -euo pipefail
+            BASE="${{ secrets.VPS_PATH }}"
+            RELS="${BASE}/releases"
+            REL="${RELS}/${GITHUB_SHA}"
+
+            # Ensure base and releases dirs exist (no sudo)
+            mkdir -p "$RELS"
+            # Create the target release dir for rsync
+            mkdir -p "$REL"
+            # Quick write test so we fail early with a clear message
+            ( cd "$REL" && touch .ci_w && rm .ci_w ) || {
+              echo "ERR: ${USER} cannot write to $REL"
+              echo "One-time fix on VPS: sudo chown -R ${USER}:${USER} ${BASE}"
+              exit 1
+            }
+
+      # --- Upload to per-release path ---
       - name: Upload to VPS (per-release)
         uses: easingthemes/ssh-deploy@v5.1.0
         with:
           SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
           REMOTE_HOST:     ${{ secrets.VPS_HOST }}
           REMOTE_USER:     ${{ secrets.VPS_USER }}
-          TARGET:          ${{ secrets.VPS_PATH }}/releases/${{ github.sha }}
+          TARGET:          ${{ secrets.VPS_PATH }}/releases/${{ github.sha }}/
           ARGS: "-az --delete"
           EXCLUDE: ".git,.github,node_modules,*.log"
 
+      # --- Install prod deps in the new release and switch symlink ---
       - name: Install prod deps & switch symlink
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -98,26 +125,22 @@ jobs:
             REL="${RELS}/${GITHUB_SHA}"
             CUR="${BASE}/current"
 
-            # Ensure directories exist & are writable by deploy user (no sudo)
-            mkdir -p "$RELS"
-
-            # Install dependencies in the NEW release dir
             cd "$REL"
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
 
-            # Flip the symlink atomically
+            # Flip symlink atomically
             ln -sfn "$REL" "$CUR"
 
-            # Restart pm2 against the stable path (current)
+            # PM2 restart against stable path
             cd "$CUR"
             sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
 
-            # Optional: keep last 5 releases to save disk
+            # Keep last 5 releases
             ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
 
-      # Warm-up poll to avoid hitting app before it’s ready
+      # --- Warm-up poll (reduces transient 502) ---
       - name: Warm-up poll
         run: |
           set -euo pipefail
@@ -130,7 +153,7 @@ jobs:
           done
           echo "Health endpoint not ready; proceeding (smokes have retries too)."
 
-      # --- Smokes: assert REAL PDFs (status + headers + magic) ---
+      # --- PDF smokes ---
       - name: Smoke A6 (strict PDF checks, retry x3)
         run: |
           set -euo pipefail
@@ -286,4 +309,5 @@ jobs:
             audit.headers
             audit.bin
           if-no-files-found: ignore
+
 
