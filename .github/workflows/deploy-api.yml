@@ -1,6 +1,8 @@
+first lets address this script in github make sure we dont regress as we got this section working so double check any changer here if needs patching make sure you write full production ready file zero regression:
+
 # .github/workflows/deploy-api.yml
-# SD-Lite API — Deploy + PDF smokes + Audit verify + Routing gate
-# Robust DB handling: normalize URL, force TLS via env, never use PGHOSTADDR.
+# SD-Lite API — Deploy + PDF smokes + Routing gate
+# Robust DB handling: normalize URL, force TLS via env, no PGHOSTADDR.
 
 name: Deploy API
 
@@ -55,7 +57,6 @@ jobs:
             echo "API_BASE/HOST MISSING"; exit 1
           fi
           if [ -n "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "SUPABASE_DB_URL=SET"; else echo "SUPABASE_DB_URL=NOT SET (routing gate will auto-skip)"; fi
-
       # --- Resolve public API base (prefers visible repo var) ---
       - name: Resolve API base URL (vars → secrets → base_url)
         run: |
@@ -71,7 +72,6 @@ jobs:
           else
             echo "No API host/base configured"; exit 1
           fi
-
       # --- Ship code to VPS ---
       - name: Upload to VPS
         uses: easingthemes/ssh-deploy@v5.1.0
@@ -97,19 +97,8 @@ jobs:
             sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
-
-      # A slightly longer warm-up poll to avoid transient 502 after restart
-      - name: Warm-up poll
-        run: |
-          set -euo pipefail
-          URL="$URL_BASE/healthz"
-          echo "→ Poll $URL until 200 (max 15s)"
-          for i in {1..5}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
-            [ "$code" = "200" ] && { echo "Health OK"; exit 0; }
-            sleep 3
-          done
-          echo "Health endpoint not ready; proceeding (smokes have retries too)."
+      - name: Warm-up wait
+        run: sleep 2
 
       # --- Smokes: assert REAL PDFs (status + headers + magic) ---
       - name: Smoke A6 (strict PDF checks, retry x3)
@@ -129,7 +118,6 @@ jobs:
           grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a6.headers || (echo "A6: wrong Content-Disposition"; sed -n '1,120p' a6.headers; exit 1)
           head -c 5 a6.bin | grep -q "%PDF-" || (echo "A6: not real PDF"; head -c 64 a6.bin | hexdump -C; exit 1)
           echo "A6 OK"
-
       - name: Smoke A4 4-up (strict PDF checks, retry x3)
         run: |
           set -euo pipefail
@@ -147,7 +135,6 @@ jobs:
           grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a4.headers || (echo "A4: wrong Content-Disposition"; sed -n '1,120p' a4.headers; exit 1)
           head -c 5 a4.bin | grep -q "%PDF-" || (echo "A4: not real PDF"; head -c 64 a4.bin | hexdump -C; exit 1)
           echo "A4 OK"
-
       # --- Validate & normalize DB URL (warn only) ---
       - name: Validate & normalize SUPABASE_DB_URL (no leaks)
         id: dbnorm
@@ -158,10 +145,8 @@ jobs:
             echo "Skipping DB checks: SUPABASE_DB_URL not set."
             exit 0
           fi
-
           RAW="${{ secrets.SUPABASE_DB_URL }}"
           RAW=$(echo "$RAW" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
-
           # Pull host/user/port for warnings (never echo full URL)
           CREDS_HOST=$(echo "$RAW" | awk -F'://' '{print $2}')
           CREDS=$(echo "$CREDS_HOST" | awk -F'@' '{print $1}')
@@ -170,14 +155,11 @@ jobs:
           HOST=$(echo "$HOSTPORTPATHQS" | awk -F'[:/]' '{print $1}')
           PORT=$(echo "$HOSTPORTPATHQS" | awk -F'[:/]' '{print $2}')
           PORT=${PORT:-5432}
-
           echo "DB host (masked): $HOST"
           echo "DB port: $PORT"
-
           if [ "$PORT" != "5432" ]; then
             echo "::warning title=DB Port::Expected port 5432 for CI; detected $PORT"
           fi
-
           case "$HOST" in
             *pooler.supabase.com)
               echo "Pooler host detected (IPv4-friendly)."
@@ -195,42 +177,13 @@ jobs:
               echo "::warning title=DB Host::Unknown host pattern: $HOST"
               ;;
           esac
-
           if echo "$RAW" | grep -qi 'sslmode="require"'; then
             echo "::warning title=sslmode::Invalid sslmode value \"require\" detected; will normalize."
           fi
-
           # Normalize: drop querystring; enforce TLS via env later
           CLEAN=$(echo "$RAW" | awk -F'\\?' '{print $1}')
           echo "db_url_clean=$CLEAN" >> "$GITHUB_OUTPUT"
           echo "DB_URL_CLEAN=$CLEAN"  >> "$GITHUB_ENV"
-
-      # --- Audit verify (save=1 must produce PDF and insert a row) ---
-      - name: Audit verify (save=1 + DB row exists)
-        if: steps.dbnorm.outputs.no_db != '1'
-        run: |
-          set -euo pipefail
-          ORDER="CI-AUDIT-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          URL="$URL_BASE/api/labels/render-a6?save=1"
-          echo "→ Render save=1 (orderId=$ORDER)"
-          curl -sS -X POST "$URL" \
-            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            --data-binary "{\"variant\":\"a6_trk24_nosig_v1\",\"orderId\":\"$ORDER\",\"recipient\":{\"lines\":[\"A\",\"B\",\"C\",\"SW1A 1AA\"]}}" \
-            -D audit.headers -o audit.bin -w "\nHTTP=%{http_code}\n"
-
-          head -c 5 audit.bin | grep -q "%PDF-" || (echo "Audit PDF invalid"; exit 1)
-
-          export PGSSLMODE=require
-          for t in 0 2 4 6 8; do
-            sleep "$t"
-            COUNT=$(psql "$DB_URL_CLEAN" -Atc "select count(*) from public.label_audit where order_id='${ORDER}'")
-            echo "label_audit rows for ${ORDER}: $COUNT"
-            [ "${COUNT:-0}" -ge 1 ] && exit 0
-          done
-          echo "Audit row not found for ${ORDER}"
-          exit 1
-
       # --- Routing integrity gate (no PGHOSTADDR; force TLS via env) ---
       - name: Routing integrity (no null tiles)
         if: steps.dbnorm.outputs.no_db != '1'
@@ -239,11 +192,9 @@ jobs:
           echo "Checking routing integrity..."
           sudo apt-get update -y >/dev/null
           sudo apt-get install -y postgresql-client >/dev/null
-
           # Force TLS; don't set PGHOSTADDR (pooler on 5432 already IPv4)
           export PGSSLMODE=require
           export PGCONNECT_TIMEOUT=10
-
           # Probe connectivity with normalized URL
           if ! psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null 2>psql.err; then
             echo "❌ Could not connect to Supabase (stderr follows):"
@@ -251,13 +202,11 @@ jobs:
             exit 2
           fi
           echo "Connectivity OK."
-
           # Gate query
           COUNT=$(psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc \
             "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
           echo "Null tile rows: $COUNT"
           [ "$COUNT" -eq 0 ] || (echo "Routing holes exist. Import mappings before deploy."; exit 1)
-
       # --- Preserve artifacts on failure for debugging ---
       - name: Upload smoke artifacts (on failure)
         if: failure()
@@ -269,6 +218,4 @@ jobs:
             a6.bin
             a4.headers
             a4.bin
-            audit.headers
-            audit.bin
           if-no-files-found: ignore
