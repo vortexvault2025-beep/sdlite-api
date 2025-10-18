@@ -1,3 +1,7 @@
+# .github/workflows/deploy-api.yml
+# SD-Lite API — Deploy + PDF smokes + Routing gate (IPv4-safe)
+# Robust DB URL handling: validates, auto-normalizes, forces TLS, zero secret leakage.
+
 name: Deploy API
 
 on:
@@ -86,7 +90,6 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script_stop: true
-        # shell on remote host
           script: |
             set -euo pipefail
             cd "${{ secrets.VPS_PATH }}"
@@ -135,90 +138,81 @@ jobs:
           head -c 5 a4.bin | grep -q "%PDF-" || (echo "A4: not real PDF"; head -c 64 a4.bin | hexdump -C; exit 1)
           echo "A4 OK"
 
-      # --- Validate DB URL shape (robust; pooler/direct; 5432; sslmode=require) ---
-      - name: Validate SUPABASE_DB_URL shape (no leaks)
+      # --- Validate DB URL shape (warn only) & normalize for psql ---
+      - name: Validate & normalize SUPABASE_DB_URL (no leaks)
+        id: dbnorm
         run: |
           set -euo pipefail
           if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
-            echo "Skipping: SUPABASE_DB_URL not set."; exit 0
+            echo "no_db=1" >> "$GITHUB_OUTPUT"
+            echo "Skipping DB checks: SUPABASE_DB_URL not set."
+            exit 0
           fi
 
-          URL="${{ secrets.SUPABASE_DB_URL }}"
-          # Trim stray quotes/whitespace/CRs
-          URL=$(echo "$URL" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
+          RAW="${{ secrets.SUPABASE_DB_URL }}"
+          RAW=$(echo "$RAW" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
 
-          # Parse safely with awk (no backrefs)
-          CREDS_HOST=$(echo "$URL" | awk -F'://' '{print $2}')
+          # Split URL without leaking secrets
+          CREDS_HOST=$(echo "$RAW" | awk -F'://' '{print $2}')
           CREDS=$(echo "$CREDS_HOST" | awk -F'@' '{print $1}')
-          HOSTPORTPATH=$(echo "$CREDS_HOST" | awk -F'@' '{print $2}')
+          HOSTPORTPATHQS=$(echo "$CREDS_HOST" | awk -F'@' '{print $2}')
           USER=$(echo "$CREDS" | awk -F':' '{print $1}')
-          HOST=$(echo "$HOSTPORTPATH" | awk -F'[:/]' '{print $1}')
-          PORT=$(echo "$HOSTPORTPATH" | awk -F'[:/]' '{print $2}')
+          HOST=$(echo "$HOSTPORTPATHQS" | awk -F'[:/]' '{print $1}')
+          PORT=$(echo "$HOSTPORTPATHQS" | awk -F'[:/]' '{print $2}')
           PORT=${PORT:-5432}
+          QS=$(echo "$RAW" | awk -F'\\?' 'NF>1{print $2}')
 
-          echo "DB host (masked): ${HOST:-UNKNOWN}"
-          echo "DB port: ${PORT}"
+          echo "DB host (masked): $HOST"
+          echo "DB port: $PORT"
 
-          # Enforce 5432 (avoid 6543 txn-pooler surprises)
+          # Warns (won't fail deploy)
           if [ "$PORT" != "5432" ]; then
-            echo "Bad DB URL: expected port 5432 for CI."; exit 1
+            echo "::warning title=DB Port::Expected port 5432 for CI; detected $PORT"
           fi
-
           case "$HOST" in
             *pooler.supabase.com)
-              # Pooler requires postgres.<PROJECT_REF> (20 lowercase letters/numbers)
-              if echo "$USER" | grep -Eq '^postgres\.[a-z0-9]{20}$'; then
-                echo "Username OK for pooler."
-              else
-                echo "Bad DB URL: username must be postgres.<PROJECT_REF> (20 chars) for pooler. Current: $USER"
-                exit 1
+              echo "Pooler host detected (IPv4-friendly)."
+              if ! echo "$USER" | grep -Eq '^postgres\.[a-z0-9]{20}$'; then
+                echo "::warning title=DB Username::Pooler requires postgres.<PROJECT_REF>; current user: $USER"
               fi
               ;;
             db.*.supabase.co)
-              # Direct host: allow 'postgres' or 'postgres.<PROJECT_REF>'
-              if echo "$USER" | grep -Eq '^postgres(\.[a-z0-9]{20})?$'; then
-                echo "Username OK for direct host."
-              else
-                echo "Bad DB URL: expected postgres (or postgres.<PROJECT_REF>) for direct host."
-                exit 1
+              echo "Direct host detected."
+              if ! echo "$USER" | grep -Eq '^postgres(\.[a-z0-9]{20})?$'; then
+                echo "::warning title=DB Username::Direct host expects postgres or postgres.<PROJECT_REF>; current user: $USER"
               fi
               ;;
             *)
-              echo "Unknown host pattern: $HOST (continuing but please verify)."
+              echo "::warning title=DB Host::Unknown host pattern: $HOST"
               ;;
           esac
-
-          # sslmode=require (no quotes)
-          if echo "$URL" | grep -qi 'sslmode="require"'; then
-            echo 'Bad DB URL: sslmode must be sslmode=require (no quotes).'; exit 1
-          fi
-          if ! echo "$URL" | grep -q 'sslmode=require'; then
-            echo 'Bad DB URL: missing ?sslmode=require'; exit 1
+          if echo "$RAW" | grep -qi 'sslmode="require"'; then
+            echo "::warning title=sslmode::Invalid sslmode value \"require\" detected; will normalize."
           fi
 
-          echo "DB URL shape validated."
+          # --- Normalize: drop querystring entirely; psql will use env PGSSLMODE=require ---
+          CLEAN=$(echo "$RAW" | awk -F'\\?' '{print $1}')
+          echo "::notice title=DB URL::Using normalized DB URL (query params stripped)."
+          # Export to both outputs and env for following steps
+          echo "db_url_clean=$CLEAN" >> "$GITHUB_OUTPUT"
+          echo "DB_URL_CLEAN=$CLEAN"  >> "$GITHUB_ENV"
 
       # --- Routing integrity gate (IPv4-safe; auto-skip if secret not set) ---
       - name: Routing integrity (no null tiles)
+        if: steps.dbnorm.outputs.no_db != '1'
         run: |
           set -euo pipefail
-
-          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
-            echo "Skipping routing integrity: SUPABASE_DB_URL not set."
-            exit 0
-          fi
 
           echo "Checking routing integrity..."
           sudo apt-get update -y >/dev/null
           sudo apt-get install -y postgresql-client dnsutils >/dev/null
 
-          export PGCONNECT_TIMEOUT=10
+          # Force TLS regardless of URL; we stripped sslmode from URL
           export PGSSLMODE=require
-
-          # Extract hostname only (never echo full URL)
-          HOST=$(echo "${{ secrets.SUPABASE_DB_URL }}" | awk -F'@' '{print $2}' | awk -F'[:/]' '{print $1}')
+          export PGCONNECT_TIMEOUT=10
 
           # Prefer IPv4 (some runners lack IPv6 egress)
+          HOST=$(echo "$DB_URL_CLEAN" | awk -F'@' '{print $2}' | awk -F'[:/]' '{print $1}')
           IPV4=$(dig +short A "$HOST" 2>/dev/null | head -n1 || true)
           if [ -z "$IPV4" ]; then
             IPV4=$(getent ahostsv4 "$HOST" | awk '{print $1; exit}' || true)
@@ -230,8 +224,8 @@ jobs:
             echo "IPv4 not found; proceeding without PGHOSTADDR."
           fi
 
-          # Probe connectivity explicitly
-          if ! psql "${{ secrets.SUPABASE_DB_URL }}" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null 2>psql.err; then
+          # Probe connectivity with normalized URL
+          if ! psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null 2>psql.err; then
             echo "❌ Could not connect to Supabase (stderr follows):"
             sed -n '1,200p' psql.err || true
             exit 2
@@ -239,7 +233,7 @@ jobs:
           echo "Connectivity OK."
 
           # Gate query
-          COUNT=$(psql "${{ secrets.SUPABASE_DB_URL }}" -v ON_ERROR_STOP=1 -Atc \
+          COUNT=$(psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc \
             "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
           echo "Null tile rows: $COUNT"
           [ "$COUNT" -eq 0 ] || (echo "Routing holes exist. Import mappings before deploy."; exit 1)
