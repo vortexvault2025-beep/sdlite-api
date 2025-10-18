@@ -93,12 +93,16 @@ jobs:
           script: |
             set -euo pipefail
             cd "${{ secrets.VPS_PATH }}"
-            NODE_ENV=production npm ci --omit=dev
+            # ensure directory is owned by the deploy user (avoids npm EACCES)
+            sudo chown -R "${{ secrets.VPS_USER }}":"${{ secrets.VPS_USER }}" .
+            # purge any stale modules created by root from old runs
+            if [ -d node_modules ]; then sudo rm -rf node_modules; fi
+            NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
             sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
 
-      # A slightly longer warm-up poll to avoid transient 502 after restart
+      # Warm-up poll to avoid hitting app before it’s ready
       - name: Warm-up poll
         run: |
           set -euo pipefail
@@ -272,3 +276,4 @@ jobs:
             audit.headers
             audit.bin
           if-no-files-found: ignore
+
