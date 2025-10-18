@@ -86,6 +86,7 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script_stop: true
+        # shell on remote host
           script: |
             set -euo pipefail
             cd "${{ secrets.VPS_PATH }}"
@@ -134,7 +135,7 @@ jobs:
           head -c 5 a4.bin | grep -q "%PDF-" || (echo "A4: not real PDF"; head -c 64 a4.bin | hexdump -C; exit 1)
           echo "A4 OK"
 
-      # --- Validate DB URL shape (robust; pooler vs direct; 5432; sslmode=require) ---
+      # --- Validate DB URL shape (robust; pooler/direct; 5432; sslmode=require) ---
       - name: Validate SUPABASE_DB_URL shape (no leaks)
         run: |
           set -euo pipefail
@@ -142,18 +143,23 @@ jobs:
             echo "Skipping: SUPABASE_DB_URL not set."; exit 0
           fi
 
-          URL='${{ secrets.SUPABASE_DB_URL }}'
+          URL="${{ secrets.SUPABASE_DB_URL }}"
           # Trim stray quotes/whitespace/CRs
-          URL=$(printf '%s' "$URL" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
+          URL=$(echo "$URL" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
 
-          USER=$(printf '%s' "$URL" | sed -E 's|^[a-z]+://([^:]+):.*|\\1|')
-          HOST=$(printf '%s' "$URL" | sed -E 's|^[a-z]+://[^@]+@([^:/?]+).*|\\1|')
-          PORT=$(printf '%s' "$URL" | sed -nE 's|^[a-z]+://[^@]+@[^:/?]+:([0-9]+).*|\\1|p'); PORT=${PORT:-5432}
+          # Parse safely with awk (no backrefs)
+          CREDS_HOST=$(echo "$URL" | awk -F'://' '{print $2}')
+          CREDS=$(echo "$CREDS_HOST" | awk -F'@' '{print $1}')
+          HOSTPORTPATH=$(echo "$CREDS_HOST" | awk -F'@' '{print $2}')
+          USER=$(echo "$CREDS" | awk -F':' '{print $1}')
+          HOST=$(echo "$HOSTPORTPATH" | awk -F'[:/]' '{print $1}')
+          PORT=$(echo "$HOSTPORTPATH" | awk -F'[:/]' '{print $2}')
+          PORT=${PORT:-5432}
 
-          echo "DB host (masked): $HOST"
-          echo "DB port: $PORT"
+          echo "DB host (masked): ${HOST:-UNKNOWN}"
+          echo "DB port: ${PORT}"
 
-          # Enforce 5432 (avoid 6543/txn-pooler surprises)
+          # Enforce 5432 (avoid 6543 txn-pooler surprises)
           if [ "$PORT" != "5432" ]; then
             echo "Bad DB URL: expected port 5432 for CI."; exit 1
           fi
@@ -164,7 +170,7 @@ jobs:
               if echo "$USER" | grep -Eq '^postgres\.[a-z0-9]{20}$'; then
                 echo "Username OK for pooler."
               else
-                echo "Bad DB URL: username must be postgres.<PROJECT_REF> (20 chars) for pooler. Current user: $USER"
+                echo "Bad DB URL: username must be postgres.<PROJECT_REF> (20 chars) for pooler. Current: $USER"
                 exit 1
               fi
               ;;
@@ -173,7 +179,8 @@ jobs:
               if echo "$USER" | grep -Eq '^postgres(\.[a-z0-9]{20})?$'; then
                 echo "Username OK for direct host."
               else
-                echo "Bad DB URL: expected postgres (or postgres.<PROJECT_REF>) for direct host."; exit 1
+                echo "Bad DB URL: expected postgres (or postgres.<PROJECT_REF>) for direct host."
+                exit 1
               fi
               ;;
             *)
@@ -209,7 +216,7 @@ jobs:
           export PGSSLMODE=require
 
           # Extract hostname only (never echo full URL)
-          HOST=$(printf '%s' "${{ secrets.SUPABASE_DB_URL }}" | sed -E 's|^[a-z]+://[^@]+@([^:/?]+).*|\\1|')
+          HOST=$(echo "${{ secrets.SUPABASE_DB_URL }}" | awk -F'@' '{print $2}' | awk -F'[:/]' '{print $1}')
 
           # Prefer IPv4 (some runners lack IPv6 egress)
           IPV4=$(dig +short A "$HOST" 2>/dev/null | head -n1 || true)
