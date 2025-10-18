@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # --- Checkout & build (runner only) ---
+      # --- Checkout & build ---
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -36,7 +36,7 @@ jobs:
       - name: Build (non-blocking)
         run: npm run build || true
 
-      # --- Sanity: ensure required secrets/vars exist (no values printed) ---
+      # --- Sanity: ensure inputs exist (no values printed) ---
       - name: Debug inputs (no secrets printed)
         run: |
           test -n "${{ secrets.VPS_HOST }}" && echo "VPS_HOST=OK" || echo "VPS_HOST=MISSING"
@@ -52,7 +52,7 @@ jobs:
           fi
           if [ -n "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "SUPABASE_DB_URL=SET"; else echo "SUPABASE_DB_URL=NOT SET (routing gate will auto-skip)"; fi
 
-      # --- Resolve public API base with safe fallbacks (prefers vars for visible host) ---
+      # --- Resolve public API base (prefers visible repo var) ---
       - name: Resolve API base URL (vars → secrets → base_url)
         run: |
           if [ -n "${{ vars.API_HOST }}" ]; then
@@ -97,7 +97,7 @@ jobs:
       - name: Warm-up wait
         run: sleep 2
 
-      # --- Smokes: assert REAL PDFs (status+headers+magic) ---
+      # --- Smokes: assert REAL PDFs (status + headers + magic) ---
       - name: Smoke A6 (strict PDF checks, retry x3)
         run: |
           set -euo pipefail
@@ -149,27 +149,34 @@ jobs:
           sudo apt-get install -y postgresql-client dnsutils >/dev/null
 
           export PGCONNECT_TIMEOUT=10
-          export PGSSLMODE=require   # force TLS regardless of pooler/direct
+          export PGSSLMODE=require   # TLS for Direct or Pooler (append ?sslmode=require in the URL too)
 
-          # Extract hostname from the URL (no echo of the URL itself)
+          # Extract hostname from the URL (do NOT echo the URL)
           HOST=$(printf '%s' "${{ secrets.SUPABASE_DB_URL }}" | sed -E 's|^[a-z]+://[^@]+@([^:/?]+).*|\\1|')
 
-          # Resolve an IPv4 address and force libpq to use it (avoids IPv6-only egress)
-          IPV4=$(dig +short A "$HOST" 2>/dev/null | head -n1)
+          # Prefer IPv4 (some runners lack IPv6 egress)
+          IPV4=$(dig +short A "$HOST" 2>/dev/null | head -n1 || true)
           if [ -z "$IPV4" ]; then
-            IPV4=$(getent ahostsv4 "$HOST" | awk '{print $1; exit}')
+            IPV4=$(getent ahostsv4 "$HOST" | awk '{print $1; exit}' || true)
           fi
           if [ -n "$IPV4" ]; then
             echo "Using IPv4 route for DB (address masked)."
             export PGHOSTADDR="$IPV4"
           else
-            echo "IPv4 resolution failed; proceeding without PGHOSTADDR."
+            echo "IPv4 not found; proceeding without PGHOSTADDR."
           fi
 
-          # Run the gate query (works for both Direct and Session Pooler URIs)
+          # Probe connectivity explicitly so failures aren’t cryptic
+          if ! psql "${{ secrets.SUPABASE_DB_URL }}" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null 2>psql.err; then
+            echo "❌ Could not connect to Supabase (stderr follows):"
+            sed -n '1,200p' psql.err || true
+            exit 2
+          fi
+          echo "Connectivity OK."
+
+          # Gate query
           COUNT=$(psql "${{ secrets.SUPABASE_DB_URL }}" -v ON_ERROR_STOP=1 -Atc \
             "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
-
           echo "Null tile rows: $COUNT"
           [ "$COUNT" -eq 0 ] || (echo "Routing holes exist. Import mappings before deploy."; exit 1)
 
