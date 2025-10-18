@@ -1,6 +1,6 @@
 # .github/workflows/deploy-api.yml
 # SD-Lite API — Deploy + PDF smokes + Audit verify + Routing gate
-# Per-release deploy to avoid EACCES on node_modules; warm-up poll; DB URL normalize.
+# Per-release deploy to avoid EACCES on node_modules; render warm-up; DB URL normalize.
 
 name: Deploy API
 
@@ -126,9 +126,9 @@ jobs:
             sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
-            ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
+            ls -1dt "${RELS}/"* 2>/null 2>/dev/null | tail -n +6 | xargs -r rm -rf
 
-      # --- Warm-up poll (hit render once) ---
+      # --- Warm-up poll (hit render once; avoid post-restart 502) ---
       - name: Warm-up poll (hit render once)
         run: |
           set -euo pipefail
@@ -149,17 +149,17 @@ jobs:
           echo "Warm-up did not produce PDF; continuing (smokes have retries)."
 
       # --- PDF smokes ---
-      - name: Smoke A6 (strict PDF checks, retry x3)
+      - name: Smoke A6 (strict PDF checks, retry x5)
         run: |
           set -euo pipefail
           URL="$URL_BASE/api/labels/render-a6?save=0"
           echo "→ POST $URL"
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             curl -sS -X POST "$URL" \
               -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
               -H "Content-Type: application/json" \
               --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A6","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
-              -D a6.headers -o a6.bin -w "\nHTTP=%{http_code}\n" && break || sleep 3
+              -D a6.headers -o a6.bin -w "\nHTTP=%{http_code}\n" && break || sleep 4
           done
           grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a6.headers || (echo "A6: non-200"; sed -n '1,120p' a6.headers; exit 1)
           grep -qi '^content-type: *application/pdf' a6.headers || (echo "A6: wrong Content-Type"; sed -n '1,120p' a6.headers; exit 1)
@@ -167,17 +167,17 @@ jobs:
           head -c 5 a6.bin | grep -q "%PDF-" || (echo "A6: not real PDF"; head -c 64 a6.bin | hexdump -C; exit 1)
           echo "A6 OK"
 
-      - name: Smoke A4 4-up (strict PDF checks, retry x3)
+      - name: Smoke A4 4-up (strict PDF checks, retry x5)
         run: |
           set -euo pipefail
           URL="$URL_BASE/api/labels/render-a4-4up?count=1&save=0"
           echo "→ POST $URL"
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             curl -sS -X POST "$URL" \
               -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
               -H "Content-Type: application/json" \
               --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A4","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
-              -D a4.headers -o a4.bin -w "\nHTTP=%{http_code}\n" && break || sleep 3
+              -D a4.headers -o a4.bin -w "\nHTTP=%{http_code}\n" && break || sleep 4
           done
           grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a4.headers || (echo "A4: non-200"; sed -n '1,120p' a4.headers; exit 1)
           grep -qi '^content-type: *application/pdf' a4.headers || (echo "A4: wrong Content-Type"; sed -n '1,120p' a4.headers; exit 1)
@@ -292,5 +292,6 @@ jobs:
             audit.headers
             audit.bin
           if-no-files-found: ignore
+
 
 
