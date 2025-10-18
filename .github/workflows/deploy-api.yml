@@ -1,6 +1,6 @@
 # .github/workflows/deploy-api.yml
 # SD-Lite API — Deploy + PDF smokes + Audit verify + Routing gate
-# Robust DB handling: normalize URL, force TLS via env, never use PGHOSTADDR.
+# Per-release deploy (blue/green) to avoid EACCES on node_modules.
 
 name: Deploy API
 
@@ -72,46 +72,52 @@ jobs:
             echo "No API host/base configured"; exit 1
           fi
 
-      # --- Ship code to VPS ---
-      - name: Upload to VPS
+      # --- Ship code to a NEW release path on VPS ---
+      - name: Upload to VPS (per-release)
         uses: easingthemes/ssh-deploy@v5.1.0
         with:
           SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
-          REMOTE_HOST: ${{ secrets.VPS_HOST }}
-          REMOTE_USER: ${{ secrets.VPS_USER }}
-          TARGET: ${{ secrets.VPS_PATH }}
+          REMOTE_HOST:     ${{ secrets.VPS_HOST }}
+          REMOTE_USER:     ${{ secrets.VPS_USER }}
+          TARGET:          ${{ secrets.VPS_PATH }}/releases/${{ github.sha }}
           ARGS: "-az --delete"
           EXCLUDE: ".git,.github,node_modules,*.log"
 
-      - name: Install prod deps & restart pm2
+      - name: Install prod deps & switch symlink
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VPS_HOST }}
+          host:     ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
           script_stop: true
+          envs: GITHUB_SHA
           script: |
             set -euo pipefail
-            cd "${{ secrets.VPS_PATH }}"
+            BASE="${{ secrets.VPS_PATH }}"
+            RELS="${BASE}/releases"
+            REL="${RELS}/${GITHUB_SHA}"
+            CUR="${BASE}/current"
 
-            # Preflight: directory must be writable by deploy user (no sudo prompt)
-            ( touch .ci_write_test && rm .ci_write_test ) || {
-              echo "ERR: ${USER} cannot write to $PWD"
-              echo "One-time fix on VPS: sudo chown -R ${USER}:${USER} ${PWD}"
-              exit 1
-            }
+            # Ensure directories exist & are writable by deploy user (no sudo)
+            mkdir -p "$RELS"
 
-            # Remove stale modules IF we own them (no sudo here)
-            [ -d node_modules ] && rm -rf node_modules || true
-
+            # Install dependencies in the NEW release dir
+            cd "$REL"
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
 
-            # pm2 is allowed via sudoers (NOPASSWD)
+            # Flip the symlink atomically
+            ln -sfn "$REL" "$CUR"
+
+            # Restart pm2 against the stable path (current)
+            cd "$CUR"
             sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
 
-      # Warm-up poll to avoid hitting app before it’s ready (reduces flake)
+            # Optional: keep last 5 releases to save disk
+            ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
+
+      # Warm-up poll to avoid hitting app before it’s ready
       - name: Warm-up poll
         run: |
           set -euo pipefail
@@ -175,7 +181,6 @@ jobs:
           RAW="${{ secrets.SUPABASE_DB_URL }}"
           RAW=$(echo "$RAW" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
 
-          # Pull host/user/port for warnings (never echo full URL)
           CREDS_HOST=$(echo "$RAW" | awk -F'://' '{print $2}')
           CREDS=$(echo "$CREDS_HOST" | awk -F'@' '{print $1}')
           HOSTPORTPATHQS=$(echo "$CREDS_HOST" | awk -F'@' '{print $2}')
@@ -213,7 +218,6 @@ jobs:
             echo "::warning title=sslmode::Invalid sslmode value \"require\" detected; will normalize."
           fi
 
-          # Normalize: drop querystring; enforce TLS via env later
           CLEAN=$(echo "$RAW" | awk -F'\\?' '{print $1}')
           echo "db_url_clean=$CLEAN" >> "$GITHUB_OUTPUT"
           echo "DB_URL_CLEAN=$CLEAN"  >> "$GITHUB_ENV"
@@ -253,11 +257,9 @@ jobs:
           sudo apt-get update -y >/dev/null
           sudo apt-get install -y postgresql-client >/dev/null
 
-          # Force TLS; don't set PGHOSTADDR (pooler on 5432 already IPv4)
           export PGSSLMODE=require
           export PGCONNECT_TIMEOUT=10
 
-          # Probe connectivity with normalized URL
           if ! psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null 2>psql.err; then
             echo "❌ Could not connect to Supabase (stderr follows):"
             sed -n '1,200p' psql.err || true
@@ -265,7 +267,6 @@ jobs:
           fi
           echo "Connectivity OK."
 
-          # Gate query
           COUNT=$(psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc \
             "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
           echo "Null tile rows: $COUNT"
