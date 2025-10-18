@@ -50,11 +50,10 @@ jobs:
           else
             echo "API_BASE/HOST MISSING"; exit 1
           fi
-          if [ -n "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "SUPABASE_DB_URL=OK"; else echo "SUPABASE_DB_URL=NOT SET (routing gate will auto-skip)"; fi
+          if [ -n "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "SUPABASE_DB_URL=SET"; else echo "SUPABASE_DB_URL=NOT SET (routing gate will auto-skip)"; fi
 
       # --- Resolve public API base with safe fallbacks (prefers vars for visible host) ---
       - name: Resolve API base URL (vars → secrets → base_url)
-        id: resolve-url
         run: |
           if [ -n "${{ vars.API_HOST }}" ]; then
             echo "URL_BASE=https://${{ vars.API_HOST }}" >> "$GITHUB_ENV"
@@ -91,7 +90,6 @@ jobs:
             set -euo pipefail
             cd "${{ secrets.VPS_PATH }}"
             NODE_ENV=production npm ci --omit=dev
-            # Restart (or start) the API; keep name consistent with your PM2 process
             sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
@@ -136,18 +134,42 @@ jobs:
           head -c 5 a4.bin | grep -q "%PDF-" || (echo "A4: not real PDF"; head -c 64 a4.bin | hexdump -C; exit 1)
           echo "A4 OK"
 
-      # --- Routing integrity gate (auto-skip if DB secret not set) ---
+      # --- Routing integrity gate (IPv4-safe; auto-skip if secret not set) ---
       - name: Routing integrity (no null tiles)
         run: |
           set -euo pipefail
+
           if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
             echo "Skipping routing integrity: SUPABASE_DB_URL not set."
             exit 0
           fi
+
           echo "Checking routing integrity..."
-          sudo apt-get update -y >/dev/null && sudo apt-get install -y postgresql-client >/dev/null
-          COUNT=$(psql "${{ secrets.SUPABASE_DB_URL }}" -Atc \
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y postgresql-client dnsutils >/dev/null
+
+          export PGCONNECT_TIMEOUT=10
+          export PGSSLMODE=require   # force TLS regardless of pooler/direct
+
+          # Extract hostname from the URL (no echo of the URL itself)
+          HOST=$(printf '%s' "${{ secrets.SUPABASE_DB_URL }}" | sed -E 's|^[a-z]+://[^@]+@([^:/?]+).*|\\1|')
+
+          # Resolve an IPv4 address and force libpq to use it (avoids IPv6-only egress)
+          IPV4=$(dig +short A "$HOST" 2>/dev/null | head -n1)
+          if [ -z "$IPV4" ]; then
+            IPV4=$(getent ahostsv4 "$HOST" | awk '{print $1; exit}')
+          fi
+          if [ -n "$IPV4" ]; then
+            echo "Using IPv4 route for DB (address masked)."
+            export PGHOSTADDR="$IPV4"
+          else
+            echo "IPv4 resolution failed; proceeding without PGHOSTADDR."
+          fi
+
+          # Run the gate query (works for both Direct and Session Pooler URIs)
+          COUNT=$(psql "${{ secrets.SUPABASE_DB_URL }}" -v ON_ERROR_STOP=1 -Atc \
             "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
+
           echo "Null tile rows: $COUNT"
           [ "$COUNT" -eq 0 ] || (echo "Routing holes exist. Import mappings before deploy."; exit 1)
 
