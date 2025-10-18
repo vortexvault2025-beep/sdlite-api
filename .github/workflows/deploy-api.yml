@@ -1,5 +1,3 @@
-first lets address this script in github make sure we dont regress as we got this section working so double check any changer here if needs patching make sure you write full production ready file zero regression:
-
 # .github/workflows/deploy-api.yml
 # SD-Lite API — Deploy + PDF smokes + Routing gate
 # Robust DB handling: normalize URL, force TLS via env, no PGHOSTADDR.
