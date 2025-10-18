@@ -1,6 +1,6 @@
 # .github/workflows/deploy-api.yml
-# SD-Lite API — Deploy + PDF smokes + Routing gate
-# Robust DB handling: normalize URL, force TLS via env, no PGHOSTADDR.
+# SD-Lite API — Deploy + PDF smokes + Audit verify + Routing gate
+# Robust DB handling: normalize URL, force TLS via env, never use PGHOSTADDR.
 
 name: Deploy API
 
@@ -98,8 +98,18 @@ jobs:
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
 
-      - name: Warm-up wait
-        run: sleep 2
+      # A slightly longer warm-up poll to avoid transient 502 after restart
+      - name: Warm-up poll
+        run: |
+          set -euo pipefail
+          URL="$URL_BASE/healthz"
+          echo "→ Poll $URL until 200 (max 15s)"
+          for i in {1..5}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            [ "$code" = "200" ] && { echo "Health OK"; exit 0; }
+            sleep 3
+          done
+          echo "Health endpoint not ready; proceeding (smokes have retries too)."
 
       # --- Smokes: assert REAL PDFs (status + headers + magic) ---
       - name: Smoke A6 (strict PDF checks, retry x3)
@@ -167,6 +177,7 @@ jobs:
           if [ "$PORT" != "5432" ]; then
             echo "::warning title=DB Port::Expected port 5432 for CI; detected $PORT"
           fi
+
           case "$HOST" in
             *pooler.supabase.com)
               echo "Pooler host detected (IPv4-friendly)."
@@ -184,6 +195,7 @@ jobs:
               echo "::warning title=DB Host::Unknown host pattern: $HOST"
               ;;
           esac
+
           if echo "$RAW" | grep -qi 'sslmode="require"'; then
             echo "::warning title=sslmode::Invalid sslmode value \"require\" detected; will normalize."
           fi
@@ -193,12 +205,37 @@ jobs:
           echo "db_url_clean=$CLEAN" >> "$GITHUB_OUTPUT"
           echo "DB_URL_CLEAN=$CLEAN"  >> "$GITHUB_ENV"
 
+      # --- Audit verify (save=1 must produce PDF and insert a row) ---
+      - name: Audit verify (save=1 + DB row exists)
+        if: steps.dbnorm.outputs.no_db != '1'
+        run: |
+          set -euo pipefail
+          ORDER="CI-AUDIT-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          URL="$URL_BASE/api/labels/render-a6?save=1"
+          echo "→ Render save=1 (orderId=$ORDER)"
+          curl -sS -X POST "$URL" \
+            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            --data-binary "{\"variant\":\"a6_trk24_nosig_v1\",\"orderId\":\"$ORDER\",\"recipient\":{\"lines\":[\"A\",\"B\",\"C\",\"SW1A 1AA\"]}}" \
+            -D audit.headers -o audit.bin -w "\nHTTP=%{http_code}\n"
+
+          head -c 5 audit.bin | grep -q "%PDF-" || (echo "Audit PDF invalid"; exit 1)
+
+          export PGSSLMODE=require
+          for t in 0 2 4 6 8; do
+            sleep "$t"
+            COUNT=$(psql "$DB_URL_CLEAN" -Atc "select count(*) from public.label_audit where order_id='${ORDER}'")
+            echo "label_audit rows for ${ORDER}: $COUNT"
+            [ "${COUNT:-0}" -ge 1 ] && exit 0
+          done
+          echo "Audit row not found for ${ORDER}"
+          exit 1
+
       # --- Routing integrity gate (no PGHOSTADDR; force TLS via env) ---
       - name: Routing integrity (no null tiles)
         if: steps.dbnorm.outputs.no_db != '1'
         run: |
           set -euo pipefail
-
           echo "Checking routing integrity..."
           sudo apt-get update -y >/dev/null
           sudo apt-get install -y postgresql-client >/dev/null
@@ -232,4 +269,6 @@ jobs:
             a6.bin
             a4.headers
             a4.bin
+            audit.headers
+            audit.bin
           if-no-files-found: ignore
