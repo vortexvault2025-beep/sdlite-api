@@ -100,8 +100,8 @@ jobs:
           ARGS: "-az --delete"
           EXCLUDE: ".git,.github,node_modules,*.log"
 
-      # --- Install prod deps, flip symlink, restart PM2, then LOCAL HEALTH-POLL ---
-      - name: Install prod deps, switch symlink, restart PM2 + health-poll
+      # --- Install prod deps, flip symlink, restart PM2, readiness + AUTO-ROLLBACK on failure ---
+      - name: Install prod deps, switch symlink, restart PM2 + health-poll (auto-rollback)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host:     ${{ secrets.VPS_HOST }}
@@ -116,6 +116,9 @@ jobs:
             REL="${RELS}/${GITHUB_SHA}"
             CUR="${BASE}/current"
 
+            # Remember previous target for rollback
+            PREV="$(readlink -f "$CUR" || true)"
+
             cd "$REL"
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
 
@@ -125,7 +128,7 @@ jobs:
               npm i dotenv@^16 --no-audit --no-fund
             fi
 
-            # Preflight: prove dotenv is resolvable in this release (fail fast if not)
+            # Preflight: fail fast if dotenv isn't resolvable
             node -e "try{console.log('dotenv:',require.resolve('dotenv'))}catch(e){console.error('dotenv MISSING in production install');process.exit(66)}"
 
             # Link base .env into this release so dotenv can load it
@@ -140,14 +143,20 @@ jobs:
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
             sudo pm2 save || true
 
-            # Ensure curl is present
+            # Derive PORT (prefer env, else .env, else 3000)
+            PORT="${PORT:-}"
+            if [ -z "$PORT" ] && [ -f "${BASE}/.env" ]; then
+              PORT="$(grep -E '^PORT=' "${BASE}/.env" | tail -1 | cut -d= -f2 | tr -d '\r' || true)"
+            fi
+            PORT="${PORT:-3000}"
+
+            # Ensure curl present
             command -v curl >/dev/null 2>&1 || { sudo apt-get update -y >/dev/null; sudo apt-get install -y curl >/dev/null; }
 
-            # Poll local health (avoid nginx): treat 200 or 401 as "responding"
-            PORT="${PORT:-3000}"
+            # Readiness poll (200 or 401 means "up"); show diagnostics on failure
             echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
             ready=0
-            for i in $(seq 1 60); do
+            for i in $(seq 1 90); do
               code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || true)"
               code=${code:-000}
               echo "healthz try #$i: HTTP $code"
@@ -159,13 +168,29 @@ jobs:
             done
 
             if [ "$ready" -ne 1 ]; then
-              echo "❌ App did not become ready on :${PORT}"
-              ss -lntp | grep ":${PORT}" || true
-              sudo pm2 logs "${{ secrets.PM2_NAME }}" --lines 80 --raw || true
+              echo "❌ App did not become ready on :${PORT} — running diagnostics + ROLLBACK"
+              echo "--- ss -lntp (who is listening?) ---"
+              ss -lntp || true
+              echo "--- pm2 describe ---"
+              sudo pm2 describe "${{ secrets.PM2_NAME }}" || true
+              echo "--- last 200 lines of logs ---"
+              sudo pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
+
+              # Auto-rollback to previous release if we have one
+              if [ -n "$PREV" ] && [ -d "$PREV" ] && [ "$PREV" != "$REL" ]; then
+                echo "↩️  Rolling back symlink to previous release: $PREV"
+                ln -sfn "$PREV" "$CUR"
+                cd "$CUR"
+                sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || true
+                sudo pm2 save || true
+                echo "Rollback complete."
+              else
+                echo "No previous release to roll back to."
+              fi
               exit 1
             fi
 
-            # Keep last 5 releases
+            # Keep last 5 releases (oldest first)
             ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
 
       # --- Public smoke tests (strict PDF checks, retry x5) ---
@@ -277,6 +302,7 @@ jobs:
             audit.headers
             audit.bin
           if-no-files-found: ignore
+
 
 
 
