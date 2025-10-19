@@ -133,16 +133,22 @@ jobs:
 
             # Poll local health (avoid nginx): treat 200 or 401 as "responding"
             PORT="${PORT:-3000}"
-            echo "Polling http://127.0.0.1:${PORT}/healthz ..."
-            for i in $(seq 1 40); do
-              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || true)"
+            echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
+            ready=0
+            for i in $(seq 1 60); do
+              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || echo 000)"
               echo "healthz try #$i: HTTP $code"
-              [ "$code" = "200" ] || [ "$code" = "401" ] && { echo "App is responding"; break; }
+              if [ "$code" = "200" ] || [ "$code" = "401" ]; then
+                ready=1
+                break
+              fi
               sleep 1
             done
-            if [ "$code" != "200" ] && [ "$code" != "401" ]; then
+
+            if [ "$ready" -ne 1 ]; then
               echo "❌ App did not become ready on :${PORT}"
               ss -lntp | grep ":${PORT}" || true
+              sudo pm2 logs "${{ secrets.PM2_NAME }}" --lines 80 --raw || true
               exit 1
             fi
 
@@ -203,7 +209,6 @@ jobs:
           CLEAN=$(echo "$RAW" | awk -F'\\?' '{print $1}')
           echo "db_url_clean=$CLEAN" >> "$GITHUB_OUTPUT"
           echo "DB_URL_CLEAN=$CLEAN"  >> "$GITHUB_ENV"
-          echo "DB host (masked): $(echo "$RAW" | awk -F'@' '{print $2}' | awk -F'[:/]' '{print $1}')"
 
       # --- Audit verify: save=1 must insert a DB row ---
       - name: Audit verify (save=1 + DB row exists)
