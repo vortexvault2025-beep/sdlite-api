@@ -3,7 +3,17 @@ name: Deploy API
 on:
   push:
     branches: [ main ]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "deploy or rollback"
+        required: true
+        default: "deploy"
+        type: choice
+        options: [deploy, rollback]
+      target_sha:
+        description: "Release SHA to roll back to (blank = previous)"
+        required: false
 
 permissions:
   contents: read
@@ -13,7 +23,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # =========================
+  # Deploy (default) job
+  # =========================
   build-deploy:
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.mode == 'deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -24,7 +38,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Setup Node.js
+      - name: Setup Node.js (runner)
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -100,8 +114,8 @@ jobs:
           ARGS: "-az --delete"
           EXCLUDE: ".git,.github,node_modules,*.log"
 
-      # --- Install prod deps, flip symlink, restart PM2, readiness + AUTO-ROLLBACK on failure ---
-      - name: Install prod deps, switch symlink, restart PM2 + health-poll (auto-rollback)
+      # --- Ensure Node 20 on VPS + deploy + readiness + AUTO-ROLLBACK ---
+      - name: Install prod deps, ensure Node 20, switch symlink, restart PM2 + health-poll (auto-rollback)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host:     ${{ secrets.VPS_HOST }}
@@ -115,6 +129,17 @@ jobs:
             RELS="${BASE}/releases"
             REL="${RELS}/${GITHUB_SHA}"
             CUR="${BASE}/current"
+
+            echo "→ Ensuring Node 20 LTS on VPS (only if needed)"
+            NODEV="$(node -v 2>/dev/null || echo v0.0.0)"
+            MAJOR="$(echo "$NODEV" | sed 's/^v//' | cut -d. -f1 || echo 0)"
+            if [ "${MAJOR:-0}" -lt 20 ]; then
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+              sudo npm i -g pm2@latest
+            fi
+            echo "node: $(node -v) ($(which node))"
+            echo "pm2 : $(pm2 -v)"
 
             # Remember previous target for rollback
             PREV="$(readlink -f "$CUR" || true)"
@@ -137,7 +162,7 @@ jobs:
             # Flip symlink atomically
             ln -sfn "$REL" "$CUR"
 
-            # Restart under PM2
+            # Restart under PM2 (pick up new Node env)
             cd "$CUR"
             sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
             sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
@@ -168,13 +193,10 @@ jobs:
             done
 
             if [ "$ready" -ne 1 ]; then
-              echo "❌ App did not become ready on :${PORT} — running diagnostics + ROLLBACK"
-              echo "--- ss -lntp (who is listening?) ---"
-              ss -lntp || true
-              echo "--- pm2 describe ---"
-              sudo pm2 describe "${{ secrets.PM2_NAME }}" || true
-              echo "--- last 200 lines of logs ---"
-              sudo pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
+              echo "❌ App did not become ready on :${PORT} — diagnostics + ROLLBACK"
+              echo "--- ss -lntp (who is listening?) ---"; ss -lntp || true
+              echo "--- pm2 describe ---"; sudo pm2 describe "${{ secrets.PM2_NAME }}" || true
+              echo "--- last 200 lines of logs ---"; sudo pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
 
               # Auto-rollback to previous release if we have one
               if [ -n "$PREV" ] && [ -d "$PREV" ] && [ "$PREV" != "$REL" ]; then
@@ -302,6 +324,62 @@ jobs:
             audit.headers
             audit.bin
           if-no-files-found: ignore
+
+  # =========================
+  # Manual rollback job
+  # =========================
+  rollback:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'rollback'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Roll back to previous/target release on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
+          envs: GITHUB_SHA
+          script: |
+            set -euo pipefail
+            BASE="${{ secrets.VPS_PATH }}"
+            RELS="${BASE}/releases"
+            CUR="${BASE}/current"
+            TARGET="${{ github.event.inputs.target_sha }}"
+            CURRENT="$(readlink -f "$CUR" || true)"
+
+            if [ -n "$TARGET" ] && [ -d "${RELS}/${TARGET}" ]; then
+              REL="${RELS}/${TARGET}"
+              echo "Rolling back to explicit target ${TARGET}"
+            else
+              echo "Finding previous release (excluding current)"
+              REL="$(ls -1dt "${RELS}/"* 2>/dev/null | grep -vF "$CURRENT" | sed -n '1p')"
+            fi
+
+            if [ -z "$REL" ] || [ ! -d "$REL" ]; then
+              echo "No rollback candidate found."; exit 1
+            fi
+
+            echo "↩️  Linking current -> $REL"
+            ln -sfn "$REL" "$CUR"
+
+            # Restart app
+            cd "$CUR"
+            sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || true
+            sudo pm2 save || true
+
+            # Verify readiness
+            PORT="${PORT:-3000}"
+            echo "Polling http://127.0.0.1:${PORT}/healthz after rollback..."
+            for i in $(seq 1 40); do
+              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || true)"
+              code=${code:-000}
+              echo "healthz try #$i: HTTP $code"
+              [ "$code" = "200" ] || [ "$code" = "401" ] && { echo "Rollback release is responding"; exit 0; }
+              sleep 1
+            done
+            echo "Rollback release did not become ready"; exit 1
+
 
 
 
