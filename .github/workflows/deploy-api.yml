@@ -119,11 +119,14 @@ jobs:
             cd "$REL"
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
 
-            # If dotenv wasn't installed (e.g., still in devDependencies), add a runtime-only fallback.
+            # Runtime-only fallback if dotenv was excluded by --omit=dev
             if [ ! -d "node_modules/dotenv" ]; then
               echo "WARN: dotenv not found after npm ci; installing runtime-only fallback"
               npm i dotenv@^16 --no-audit --no-fund
             fi
+
+            # Preflight: prove dotenv is resolvable in this release (fail fast if not)
+            node -e "try{console.log('dotenv:',require.resolve('dotenv'))}catch(e){console.error('dotenv MISSING in production install');process.exit(66)}"
 
             # Link base .env into this release so dotenv can load it
             [ -f "${BASE}/.env" ] && ln -sfn "${BASE}/.env" "${REL}/.env" || true
@@ -145,7 +148,8 @@ jobs:
             echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
             ready=0
             for i in $(seq 1 60); do
-              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || echo 000)"
+              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || true)"
+              code=${code:-000}
               echo "healthz try #$i: HTTP $code"
               if [ "$code" = "200" ] || [ "$code" = "401" ]; then
                 ready=1
