@@ -1,3 +1,4 @@
+# .github/workflows/deploy-api.yml
 name: Deploy API
 
 on:
@@ -18,11 +19,12 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # --- Checkout & build on runner ---
       - name: Checkout
         uses: actions/checkout@v4
         with: { fetch-depth: 1 }
 
-      - name: Setup Node.js (runner)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -34,6 +36,7 @@ jobs:
       - name: Build (non-blocking)
         run: npm run build || true
 
+      # --- Sanity (no secret values printed) ---
       - name: Debug inputs (no secrets printed)
         run: |
           test -n "${{ secrets.VPS_HOST }}" && echo "VPS_HOST=OK" || (echo "VPS_HOST=MISSING"; exit 1)
@@ -49,6 +52,7 @@ jobs:
           fi
           if [ -n "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "SUPABASE_DB_URL=SET"; else echo "SUPABASE_DB_URL=NOT SET (routing gate will auto-skip)"; fi
 
+      # --- Resolve public base URL for smokes ---
       - name: Resolve API base URL (vars → secrets → base_url)
         run: |
           if [ -n "${{ vars.API_HOST }}" ]; then
@@ -61,6 +65,7 @@ jobs:
             echo "No API host/base configured"; exit 1
           fi
 
+      # --- Prepare release dir on VPS ---
       - name: Prepare release dir on VPS
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -75,11 +80,9 @@ jobs:
             RELS="${BASE}/releases"
             REL="${RELS}/${GITHUB_SHA}"
             mkdir -p "$RELS" "$REL"
-            ( cd "$REL" && touch .ci_w && rm .ci_w ) || {
-              echo "ERR: cannot write to $REL; fix ownership: sudo chown -R ${USER}:${USER} ${BASE}"
-              exit 1
-            }
+            ( cd "$REL" && touch .ci_w && rm .ci_w ) || { echo "ERR: cannot write to $REL"; exit 1; }
 
+      # --- Upload build to per-release path ---
       - name: Upload to VPS (per-release)
         uses: easingthemes/ssh-deploy@v5.1.0
         with:
@@ -90,7 +93,8 @@ jobs:
           ARGS: "-az --delete"
           EXCLUDE: ".git,.github,node_modules,*.log"
 
-      - name: Install prod deps, link .env, switch symlink, restart pm2 (no sudo), readiness + auto-rollback
+      # --- Install prod deps, link .env, switch symlink, PM2 start with dotenv, readiness (no sudo), auto-rollback ---
+      - name: Install prod deps & start (pm2 + dotenv preload) + readiness
         uses: appleboy/ssh-action@v1.0.3
         with:
           host:     ${{ secrets.VPS_HOST }}
@@ -104,37 +108,53 @@ jobs:
             RELS="${BASE}/releases"
             REL="${RELS}/${GITHUB_SHA}"
             CUR="${BASE}/current"
+
+            # Remember previous target for rollback
             PREV="$(readlink -f "$CUR" || true)"
 
+            # Install production deps in the new release
             cd "$REL"
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
 
-            # preflight: ensure dotenv is resolvable (CI omits dev deps)
-            node -e "try{require.resolve('dotenv');console.log('dotenv OK')}catch(e){process.exit(66)}" || { echo 'dotenv missing'; npm i dotenv@^16 --no-audit --no-fund; }
+            # Ensure dotenv exists in this release (safe if omitted by --omit=dev)
+            [ -d node_modules/dotenv ] || npm i dotenv@^16 --no-audit --no-fund
 
-            # link base .env
+            # Link base .env into current release for local tools
             [ -f "${BASE}/.env" ] && ln -sfn "${BASE}/.env" "${REL}/.env" || true
 
-            # flip symlink
+            # Flip 'current' symlink
             ln -sfn "$REL" "$CUR"
 
-            # restart pm2 UNDER THIS USER (no sudo)
+            # Start PM2 with dotenv preloaded (no sudo; same as our manual run)
             cd "$CUR"
-            pm2 restart "${{ secrets.PM2_NAME }}" --update-env || pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
+            pm2 delete "${{ secrets.PM2_NAME }}" || true
+            DOTENV_CONFIG_PATH="${BASE}/.env" \
+            pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
+              --interpreter node --interpreter-args "-r dotenv/config"
             pm2 save || true
 
-            # determine PORT
+            # Resolve PORT (env → .env → 3000)
             PORT="${PORT:-}"
-            if [ -z "$PORT" ] && [ -f "${BASE}/.env" ]; then PORT="$(grep -E '^PORT=' "${BASE}/.env" | tail -1 | cut -d= -f2 | tr -d '\r' || true)"; fi
+            if [ -z "$PORT" ] && [ -f "${BASE}/.env" ]; then
+              PORT="$(grep -E '^PORT=' "${BASE}/.env" | tail -1 | cut -d= -f2 | tr -d '\r')"
+            fi
             PORT="${PORT:-3000}"
 
-            # readiness (accept 200/401)
+            # Readiness poll (prefer curl, fallback to wget); accept 200 or 401
+            get_code() {
+              local c
+              c="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" 2>/dev/null || true)"
+              if [ -z "$c" ] || [ "$c" = "000" ]; then
+                c="$(wget -qO- --server-response "http://127.0.0.1:${PORT}/healthz" 2>&1 | awk '/^  HTTP/{print $2; exit}' || true)"
+              fi
+              echo "${c:-000}"
+            }
+
             echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
             ready=0
             for i in $(seq 1 90); do
-              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || true)"
-              code=${code:-000}
-              echo "healthz try #$i: HTTP $code"
+              code="$(get_code)"
+              echo "healthz try #$i: HTTP ${code}"
               if [ "$code" = "200" ] || [ "$code" = "401" ]; then ready=1; break; fi
               sleep 1
             done
@@ -148,7 +168,10 @@ jobs:
                 echo "↩️  Rolling back to $PREV"
                 ln -sfn "$PREV" "$CUR"
                 cd "$CUR"
-                pm2 restart "${{ secrets.PM2_NAME }}" --update-env || true
+                pm2 delete "${{ secrets.PM2_NAME }}" || true
+                DOTENV_CONFIG_PATH="${BASE}/.env" \
+                pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
+                  --interpreter node --interpreter-args "-r dotenv/config"
                 pm2 save || true
               else
                 echo "No previous release to roll back to."
@@ -156,58 +179,71 @@ jobs:
               exit 1
             fi
 
-            # keep last 5 releases
+            # Keep last 5 releases (oldest trimmed)
             ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
 
-      - name: Smoke A6 (strict PDF checks, retry x5)
+      # --- Public smokes: strict PDF checks ---
+      - name: Smoke A6 (strict PDF checks)
         run: |
           set -euo pipefail
           URL="$URL_BASE/api/labels/render-a6?save=0"
           BODY='{"variant":"a6_trk24_nosig_v1","orderId":"CI-A6","recipient":{"lines":["A","B","C","SW1A 1AA"]}}'
-          for i in 1 2 3 4 5; do
-            curl -sS -X POST "$URL" -H "X-Api-Key: ${{ secrets.X_API_KEY }}" -H "Content-Type: application/json" --data-binary "$BODY" -D a6.headers -o a6.bin -w "\nHTTP=%{http_code}\n" && break || sleep 2
-          done
+          curl -sS -X POST "$URL" \
+            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            --data-binary "$BODY" \
+            -D a6.headers -o a6.bin -w "\nHTTP=%{http_code}\n"
           grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a6.headers || { sed -n '1,120p' a6.headers; exit 1; }
           grep -qi '^content-type: *application/pdf' a6.headers || { sed -n '1,120p' a6.headers; exit 1; }
           grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a6.headers || { sed -n '1,120p' a6.headers; exit 1; }
           head -c 5 a6.bin | grep -q "%PDF-" || { head -c 64 a6.bin | hexdump -C; exit 1; }
 
-      - name: Smoke A4 4-up (strict PDF checks, retry x5)
+      - name: Smoke A4 4-up (strict PDF checks)
         run: |
           set -euo pipefail
           URL="$URL_BASE/api/labels/render-a4-4up?count=1&save=0"
           BODY='{"variant":"a6_trk24_nosig_v1","orderId":"CI-A4","recipient":{"lines":["A","B","C","SW1A 1AA"]}}'
-          for i in 1 2 3 4 5; do
-            curl -sS -X POST "$URL" -H "X-Api-Key: ${{ secrets.X_API_KEY }}" -H "Content-Type: application/json" --data-binary "$BODY" -D a4.headers -o a4.bin -w "\nHTTP=%{http_code}\n" && break || sleep 2
-          done
+          curl -sS -X POST "$URL" \
+            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            --data-binary "$BODY" \
+            -D a4.headers -o a4.bin -w "\nHTTP=%{http_code}\n"
           grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a4.headers || { sed -n '1,120p' a4.headers; exit 1; }
           grep -qi '^content-type: *application/pdf' a4.headers || { sed -n '1,120p' a4.headers; exit 1; }
           grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a4.headers || { sed -n '1,120p' a4.headers; exit 1; }
           head -c 5 a4.bin | grep -q "%PDF-" || { head -c 64 a4.bin | hexdump -C; exit 1; }
 
-      - name: Validate & normalize SUPABASE_DB_URL (no leaks)
+      # --- Validate & normalize DB URL on runner ---
+      - name: Validate & normalize SUPABASE_DB_URL (runner only)
         id: dbnorm
         run: |
           set -euo pipefail
-          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "no_db=1" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
+            echo "no_db=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           RAW="${{ secrets.SUPABASE_DB_URL }}"
           RAW=$(echo "$RAW" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
           CLEAN=$(echo "$RAW" | awk -F'\\?' '{print $1}')
           echo "db_url_clean=$CLEAN" >> "$GITHUB_OUTPUT"
           echo "DB_URL_CLEAN=$CLEAN"  >> "$GITHUB_ENV"
 
-      - name: Audit verify (save=1 + DB row exists)
+      # --- Audit verify: save=1 must create a DB row ---
+      - name: Audit verify (save=1 + row exists)
         if: steps.dbnorm.outputs.no_db != '1'
         run: |
           set -euo pipefail
           ORDER="CI-AUDIT-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           URL="$URL_BASE/api/labels/render-a6?save=1"
-          curl -sS -X POST "$URL" -H "X-Api-Key: ${{ secrets.X_API_KEY }}" -H "Content-Type: application/json" \
+          curl -sS -X POST "$URL" \
+            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
+            -H "Content-Type: application/json" \
             --data-binary "{\"variant\":\"a6_trk24_nosig_v1\",\"orderId\":\"$ORDER\",\"recipient\":{\"lines\":[\"A\",\"B\",\"C\",\"SW1A 1AA\"]}}" \
             -D audit.headers -o audit.bin -w "\nHTTP=%{http_code}\n"
           head -c 5 audit.bin | grep -q "%PDF-" || { echo "Audit PDF invalid"; exit 1; }
-          sudo apt-get update -y >/dev/null || true
-          sudo apt-get install -y postgresql-client >/dev/null || true
+
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y postgresql-client >/dev/null
           export PGSSLMODE=require
           for t in 0 2 4 6 8; do
             sleep "$t"
@@ -215,20 +251,24 @@ jobs:
             echo "label_audit rows for ${ORDER}: $COUNT"
             [ "${COUNT:-0}" -ge 1 ] && exit 0
           done
-          echo "Audit row not found for ${ORDER}"; exit 1
+          echo "Audit row not found for ${ORDER}"
+          exit 1
 
+      # --- Routing integrity gate ---
       - name: Routing integrity (no null tiles)
         if: steps.dbnorm.outputs.no_db != '1'
         run: |
           set -euo pipefail
-          sudo apt-get update -y >/dev/null || true
-          sudo apt-get install -y postgresql-client >/dev/null || true
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y postgresql-client >/dev/null
           export PGSSLMODE=require PGCONNECT_TIMEOUT=10
           psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null
-          COUNT=$(psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
+          COUNT=$(psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc \
+            "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
           echo "Null tile rows: $COUNT"
           [ "$COUNT" -eq 0 ] || { echo "Routing holes exist. Import mappings before deploy."; exit 1; }
 
+      # --- Preserve artifacts on failure ---
       - name: Upload smoke artifacts (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
@@ -242,6 +282,7 @@ jobs:
             audit.headers
             audit.bin
           if-no-files-found: ignore
+
 
 
 
