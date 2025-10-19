@@ -119,6 +119,15 @@ jobs:
             cd "$REL"
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
 
+            # If dotenv wasn't installed (e.g., still in devDependencies), add a runtime-only fallback.
+            if [ ! -d "node_modules/dotenv" ]; then
+              echo "WARN: dotenv not found after npm ci; installing runtime-only fallback"
+              npm i dotenv@^16 --no-audit --no-fund
+            fi
+
+            # Link base .env into this release so dotenv can load it
+            [ -f "${BASE}/.env" ] && ln -sfn "${BASE}/.env" "${REL}/.env" || true
+
             # Flip symlink atomically
             ln -sfn "$REL" "$CUR"
 
