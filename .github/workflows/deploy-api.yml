@@ -1,110 +1,136 @@
-name: Deploy API (SD-Lite)
+# SD-Lite API — Deploy + PDF smokes + Routing gate
+# Single PM2 daemon (root), safe PORT detection, and readiness-friendly deploy.
+
+name: Deploy API
 
 on:
   push:
-    branches: [ "main" ]
-    paths-ignore:
-      - "**/*.md"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.svg"
-  workflow_dispatch:
-
-concurrency:
-  group: deploy-api-${{ github.ref }}
-  cancel-in-progress: false
+    branches: [ main ]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
-env:
-  NODE_VERSION: "20.x"
+concurrency:
+  group: api-deploy-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  deploy:
-    name: Deploy to VPS (PM2)
+  build-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
+      # --- Checkout & build ---
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Compute release id
-        id: rel
-        run: |
-          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
-          date -u +"%Y-%m-%dT%H:%M:%SZ"
-
-      - name: Node setup
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: "20"
+          cache: "npm"
 
-      - name: Upload sources to release dir
-        uses: appleboy/scp-action@v0.1.7
+      - name: Install deps
+        run: npm ci
+
+      - name: Build (non-blocking)
+        run: npm run build || true
+
+      # --- Sanity: ensure inputs (no values printed) ---
+      - name: Debug inputs (no secrets printed)
+        run: |
+          test -n "${{ secrets.VPS_HOST }}" && echo "VPS_HOST=OK" || echo "VPS_HOST=MISSING"
+          test -n "${{ secrets.VPS_USER }}" && echo "VPS_USER=OK" || echo "VPS_USER=MISSING"
+          test -n "${{ secrets.VPS_PATH }}" && echo "VPS_PATH=OK" || echo "VPS_PATH=MISSING"
+          if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then echo "VPS_SSH_KEY=OK"; else echo "VPS_SSH_KEY=MISSING"; fi
+          test -n "${{ secrets.PM2_NAME }}" && echo "PM2_NAME=OK" || echo "PM2_NAME=MISSING"
+          test -n "${{ secrets.X_API_KEY }}" && echo "X_API_KEY=OK" || echo "X_API_KEY=MISSING"
+          if [ -n "${{ vars.API_HOST }}" ] || [ -n "${{ secrets.API_HOST }}" ] || [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            echo "API_BASE/HOST present"
+          else
+            echo "API_BASE/HOST MISSING"; exit 1
+          fi
+          if [ -n "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "SUPABASE_DB_URL=SET"; else echo "SUPABASE_DB_URL=NOT SET (routing gate will auto-skip)"; fi
+
+      # --- Resolve public API base (vars → secrets → base_url) ---
+      - name: Resolve API base URL (vars → secrets → base_url)
+        run: |
+          if [ -n "${{ vars.API_HOST }}" ]; then
+            echo "URL_BASE=https://${{ vars.API_HOST }}" >> "$GITHUB_ENV"
+            echo "Resolved via vars.API_HOST"
+          elif [ -n "${{ secrets.API_HOST }}" ]; then
+            echo "URL_BASE=https://${{ secrets.API_HOST }}" >> "$GITHUB_ENV"
+            echo "Resolved via secrets.API_HOST (masked)"
+          elif [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            echo "URL_BASE=${{ secrets.API_BASE_URL }}" >> "$GITHUB_ENV"
+            echo "Resolved via secrets.API_BASE_URL (masked)"
+          else
+            echo "No API host/base configured"; exit 1
+          fi
+
+      # --- Ship code to VPS target path (no per-release; matches last known-good) ---
+      - name: Upload to VPS
+        uses: easingthemes/ssh-deploy@v5.1.0
         with:
-          host:     ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          source:   "."
-          target:   "${{ secrets.VPS_PATH }}/releases/${{ steps.rel.outputs.sha }}"
-          rm:       false
-          strip_components: 0
+          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
+          REMOTE_HOST: ${{ secrets.VPS_HOST }}
+          REMOTE_USER: ${{ secrets.VPS_USER }}
+          TARGET: ${{ secrets.VPS_PATH }}
+          ARGS: "-az --delete"
+          EXCLUDE: ".git,.github,node_modules,*.log"
 
-      - name: Install prod deps & start (pm2 + dotenv preload) + readiness (diagnostic)
+      # --- Single-daemon PM2 restart (root) + readiness ---
+      - name: Install prod deps & restart pm2 (root) + readiness
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host:     ${{ secrets.VPS_HOST }}
+          host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          envs: GITHUB_SHA
+          key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             set -euo pipefail
-            # Print failing line + PM2/ports on any error
-            trap 'ret=$?; echo "::error::SSH script failed on line ${LINENO} (exit=$ret)"; pm2 describe "${{ secrets.PM2_NAME }}" || true; pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true; ss -lntp || true; exit $ret' ERR
+            trap 'ret=$?; echo "::error::SSH script failed on line ${LINENO} (exit=$ret)"; sudo pm2 describe "${{ secrets.PM2_NAME }}" || true; sudo pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true; sudo ss -lntp || true; exit $ret' ERR
             set -x
 
-            BASE="${{ secrets.VPS_PATH }}"
-            RELS="${BASE}/releases"
-            REL="${RELS}/${GITHUB_SHA}"
-            CUR="${BASE}/current"
-
-            mkdir -p "$REL"
-            cd "$REL"
-
+            cd "${{ secrets.VPS_PATH }}"
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
-            [ -d node_modules/dotenv ] || npm i dotenv@^16 --no-audit --no-fund
 
-            # Link env and switch current -> this release
-            [ -f "${BASE}/.env" ] && ln -sfn "${BASE}/.env" "${REL}/.env" || true
-            ln -sfn "$REL" "$CUR"
+            # 1) Ensure only root-owned PM2 will run this app
+            pm2 delete "${{ secrets.PM2_NAME }}" || true        # kill any user-owned daemon app
+            pm2 kill || true                                     # stop user-owned PM2 daemon, if any
+            sudo pm2 delete "${{ secrets.PM2_NAME }}" || true    # remove from root-owned PM2 (avoid respawn)
 
-            # Free :3000 if bound
-            PIDS="$(ss -lntp | awk '/:3000/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
-            for p in $PIDS; do kill -TERM "$p" || true; sleep 1; kill -0 "$p" 2>/dev/null && kill -9 "$p" || true; done
+            # 2) Free :3000 from any owner (root or user), then double-check
+            PIDS="$(sudo ss -lntp | awk '/:3000[[:space:]]/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
+            for p in $PIDS; do
+              sudo kill -TERM "$p" || true
+            done
+            sleep 1
+            for p in $PIDS; do
+              sudo kill -0 "$p" 2>/dev/null && sudo kill -9 "$p" || true
+            done
 
-            cd "$CUR"
-            pm2 delete "${{ secrets.PM2_NAME }}" || true
-            DOTENV_CONFIG_PATH="${BASE}/.env" \
-            pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
+            # 3) Start via root-owned PM2 with dotenv preload
+            DOTENV_CONFIG_PATH="${{ secrets.VPS_PATH }}/.env" \
+            sudo pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
               --interpreter node --interpreter-args "-r dotenv/config"
-            pm2 save || true
-            pm2 ls || true
+            sudo pm2 save || true
+            sudo pm2 ls || true
 
-            # Assert online (trap prints context if grep fails)
-            pm2 describe "${{ secrets.PM2_NAME }}" | grep -Eiq 'status[[:space:]]*│[[:space:]]*online'
+            # 4) Assert "online"
+            sudo pm2 describe "${{ secrets.PM2_NAME }}" | grep -Eiq 'status[[:space:]]*│[[:space:]]*online'
 
-            # Resolve PORT (default 3000)
+            # 5) Resolve PORT safely (do NOT fail if PORT missing under pipefail)
             PORT="${PORT:-}"
-            if [ -z "$PORT" ] && [ -f "${BASE}/.env" ]; then
-              PORT="$(grep -E '^PORT=' "${BASE}/.env" | tail -1 | cut -d= -f2 | tr -d '\r')"
+            if [ -z "$PORT" ] && [ -f "./.env" ]; then
+              PORT="$( (grep -E '^PORT=' "./.env" || true) | tail -1 | cut -d= -f2 | tr -d '\r' )"
             fi
             PORT="${PORT:-3000}"
             echo "PORT=$PORT"
 
-            # Readiness: accept 200 or 401
+            # 6) Readiness (accept 200 or 401)
             echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
             ready=0
             for i in $(seq 1 90); do
@@ -117,36 +143,140 @@ jobs:
               if [ "$code" = "200" ] || [ "$code" = "401" ]; then ready=1; break; fi
               sleep 1
             done
-
             if [ "$ready" -ne 1 ]; then
               echo "Not ready; who is listening on :${PORT}?"
-              ss -lntp || true
-              pm2 describe "${{ secrets.PM2_NAME }}" || true
-              pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
-
-              PREV="$(readlink -f "$CUR" || true)"
-              if [ -n "$PREV" ] && [ -d "$PREV" ] && [ "$PREV" != "$REL" ]; then
-                echo "Rollback to $PREV"
-                ln -sfn "$PREV" "$CUR"
-                cd "$CUR"
-                pm2 delete "${{ secrets.PM2_NAME }}" || true
-                DOTENV_CONFIG_PATH="${BASE}/.env" \
-                pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
-                  --interpreter node --interpreter-args "-r dotenv/config"
-                pm2 save || true
-              else
-                echo "No previous release to roll back to."
-              fi
+              sudo ss -lntp || true
+              sudo pm2 describe "${{ secrets.PM2_NAME }}" || true
+              sudo pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
               exit 1
             fi
 
-            # Trim old releases (keep most recent 5)
-            ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
-
-            # Post-deploy info (kept in same SSH step to avoid YAML dedent issues)
-            pm2 ls || true
+            # 7) Post-deploy info
+            sudo pm2 ls || true
             echo "Deployed commit: ${GITHUB_SHA}"
             echo "PM2 app: ${{ secrets.PM2_NAME }}"
+
+      - name: Warm-up wait
+        run: sleep 2
+
+      # --- Smokes: assert REAL PDFs (status + headers + magic) ---
+      - name: Smoke A6 (strict PDF checks, retry x3)
+        run: |
+          set -euo pipefail
+          URL="$URL_BASE/api/labels/render-a6?save=0"
+          echo "→ POST $URL"
+          for i in 1 2 3; do
+            curl -sS -X POST "$URL" \
+              -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A6","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
+              -D a6.headers -o a6.bin -w "\nHTTP=%{http_code}\n" && break || sleep 1
+          done
+          grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a6.headers || (echo "A6: non-200"; sed -n '1,120p' a6.headers; exit 1)
+          grep -qi '^content-type: *application/pdf' a6.headers || (echo "A6: wrong Content-Type"; sed -n '1,120p' a6.headers; exit 1)
+          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a6.headers || (echo "A6: wrong Content-Disposition"; sed -n '1,120p' a6.headers; exit 1)
+          head -c 5 a6.bin | grep -q "%PDF-" || (echo "A6: not real PDF"; head -c 64 a6.bin | hexdump -C; exit 1)
+          echo "A6 OK"
+
+      - name: Smoke A4 4-up (strict PDF checks, retry x3)
+        run: |
+          set -euo pipefail
+          URL="$URL_BASE/api/labels/render-a4-4up?count=1&save=0"
+          echo "→ POST $URL"
+          for i in 1 2 3; do
+            curl -sS -X POST "$URL" \
+              -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              --data-binary '{"variant":"a6_trk24_nosig_v1","orderId":"CI-A4","recipient":{"lines":["A","B","C","SW1A 1AA"]}}' \
+              -D a4.headers -o a4.bin -w "\nHTTP=%{http_code}\n" && break || sleep 1
+          done
+          grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a4.headers || (echo "A4: non-200"; sed -n '1,120p' a4.headers; exit 1)
+          grep -qi '^content-type: *application/pdf' a4.headers || (echo "A4: wrong Content-Type"; sed -n '1,120p' a4.headers; exit 1)
+          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a4.headers || (echo "A4: wrong Content-Disposition"; sed -n '1,120p' a4.headers; exit 1)
+          head -c 5 a4.bin | grep -q "%PDF-" || (echo "A4: not real PDF"; head -c 64 a4.bin | hexdump -C; exit 1)
+          echo "A4 OK"
+
+      # --- Validate & normalize DB URL (warn only) ---
+      - name: Validate & normalize SUPABASE_DB_URL (no leaks)
+        id: dbnorm
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
+            echo "no_db=1" >> "$GITHUB_OUTPUT"
+            echo "Skipping DB checks: SUPABASE_DB_URL not set."
+            exit 0
+          fi
+          RAW="${{ secrets.SUPABASE_DB_URL }}"
+          RAW=$(echo "$RAW" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
+          CREDS_HOST=$(echo "$RAW" | awk -F'://' '{print $2}')
+          CREDS=$(echo "$CREDS_HOST" | awk -F'@' '{print $1}')
+          HOSTPORTPATHQS=$(echo "$CREDS_HOST" | awk -F'@' '{print $2}')
+          USER=$(echo "$CREDS" | awk -F':' '{print $1}')
+          HOST=$(echo "$HOSTPORTPATHQS" | awk -F'[:/]' '{print $1}')
+          PORT=$(echo "$HOSTPORTPATHQS" | awk -F'[:/]' '{print $2}')
+          PORT=${PORT:-5432}
+          echo "DB host (masked): $HOST"
+          echo "DB port: $PORT"
+          if [ "$PORT" != "5432" ]; then
+            echo "::warning title=DB Port::Expected port 5432 for CI; detected $PORT"
+          fi
+          case "$HOST" in
+            *pooler.supabase.com)
+              echo "Pooler host detected (IPv4-friendly)."
+              if ! echo "$USER" | grep -Eq '^postgres\.[a-z0-9]{20}$'; then
+                echo "::warning title=DB Username::Pooler requires postgres.<PROJECT_REF>; current user: $USER"
+              fi
+              ;;
+            db.*.supabase.co)
+              echo "Direct host detected."
+              if ! echo "$USER" | grep -Eq '^postgres(\.[a-z0-9]{20})?$'; then
+                echo "::warning title=DB Username::Direct host expects postgres or postgres.<PROJECT_REF>; current user: $USER"
+              fi
+              ;;
+            *)
+              echo "::warning title=DB Host::Unknown host pattern: $HOST"
+              ;;
+          esac
+          if echo "$RAW" | grep -qi 'sslmode="require"'; then
+            echo "::warning title=sslmode::Invalid sslmode value \"require\" detected; will normalize."
+          fi
+          CLEAN=$(echo "$RAW" | awk -F'\\?' '{print $1}')
+          echo "db_url_clean=$CLEAN" >> "$GITHUB_OUTPUT"
+          echo "DB_URL_CLEAN=$CLEAN"  >> "$GITHUB_ENV"
+
+      # --- Routing integrity gate ---
+      - name: Routing integrity (no null tiles)
+        if: steps.dbnorm.outputs.no_db != '1'
+        run: |
+          set -euo pipefail
+          echo "Checking routing integrity..."
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y postgresql-client >/dev/null
+          export PGSSLMODE=require
+          export PGCONNECT_TIMEOUT=10
+          if ! psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null 2>psql.err; then
+            echo "❌ Could not connect to Supabase (stderr follows):"
+            sed -n '1,200p' psql.err || true
+            exit 2
+          fi
+          echo "Connectivity OK."
+          COUNT=$(psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc \
+            "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
+          echo "Null tile rows: $COUNT"
+          [ "$COUNT" -eq 0 ] || (echo "Routing holes exist. Import mappings before deploy."; exit 1)
+
+      # --- Preserve artifacts on failure for debugging ---
+      - name: Upload smoke artifacts (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts
+          path: |
+            a6.headers
+            a6.bin
+            a4.headers
+            a4.bin
+          if-no-files-found: ignore
 
 
 
