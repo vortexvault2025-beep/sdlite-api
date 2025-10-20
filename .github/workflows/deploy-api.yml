@@ -1,5 +1,4 @@
-# --- Install prod deps, link .env, switch symlink, PM2 start with dotenv, readiness (diagnostic), auto-rollback ---
-- name: Install prod deps & start (pm2 + dotenv preload) + readiness (diagnostic)
+name: Install prod deps & start (pm2 + dotenv preload) + readiness (diagnostic)
   uses: appleboy/ssh-action@v1.0.3
   with:
     host:     ${{ secrets.VPS_HOST }}
@@ -107,8 +106,6 @@
       echo "::group::Keep 5 latest releases"
       ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
       echo "::endgroup::"
-
-
 
 
 
