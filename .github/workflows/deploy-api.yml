@@ -59,7 +59,6 @@ jobs:
           host:     ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key:      ${{ secrets.VPS_SSH_KEY }}
-          script_stop: true
           envs: GITHUB_SHA
           script: |
             set -euo pipefail
@@ -143,19 +142,17 @@ jobs:
             ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
 
       - name: Post-deploy: print URL and PM2 app list
-        if: always()
+        if: ${{ always() }}
         uses: appleboy/ssh-action@v1.0.3
         with:
           host:     ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key:      ${{ secrets.VPS_SSH_KEY }}
-          script_stop: false
           script: |
             set -euo pipefail
             pm2 ls || true
             echo "Deployed commit: ${GITHUB_SHA}"
             echo "PM2 app: ${{ secrets.PM2_NAME }}"
-
 
 
 
