@@ -1,5 +1,5 @@
 # SD-Lite API — Deploy + PDF smokes + Routing gate
-# Single PM2 daemon (root), safe PORT detection, and readiness-friendly deploy.
+# Single PM2 daemon (root), ownership fix for npm ci, safe PORT detection.
 
 name: Deploy API
 
@@ -71,7 +71,7 @@ jobs:
             echo "No API host/base configured"; exit 1
           fi
 
-      # --- Ship code to VPS target path (no per-release; matches last known-good) ---
+      # --- Ship code to VPS target path (matches last known-good layout) ---
       - name: Upload to VPS
         uses: easingthemes/ssh-deploy@v5.1.0
         with:
@@ -82,7 +82,7 @@ jobs:
           ARGS: "-az --delete"
           EXCLUDE: ".git,.github,node_modules,*.log"
 
-      # --- Single-daemon PM2 restart (root) + readiness ---
+      # --- Single-daemon PM2 (root) + ownership fix + readiness ---
       - name: Install prod deps & restart pm2 (root) + readiness
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -95,34 +95,38 @@ jobs:
             set -x
 
             cd "${{ secrets.VPS_PATH }}"
+
+            # Fix ownership (previous runs created root-owned node_modules)
+            # Make everything writable by the SSH user BEFORE npm ci
+            sudo chown -R "${USER}:${USER}" .
+
+            # Clean any root-owned node_modules to avoid EACCES
+            [ -d node_modules ] && sudo rm -rf node_modules || true
+
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
 
-            # 1) Ensure only root-owned PM2 will run this app
-            pm2 delete "${{ secrets.PM2_NAME }}" || true        # kill any user-owned daemon app
-            pm2 kill || true                                     # stop user-owned PM2 daemon, if any
-            sudo pm2 delete "${{ secrets.PM2_NAME }}" || true    # remove from root-owned PM2 (avoid respawn)
+            # Ensure only root-owned PM2 will run this app
+            pm2 delete "${{ secrets.PM2_NAME }}" || true     # kill any user-owned app
+            pm2 kill || true                                  # stop user-owned PM2 daemon
+            sudo pm2 delete "${{ secrets.PM2_NAME }}" || true # remove from root-owned PM2 (avoid respawn)
 
-            # 2) Free :3000 from any owner (root or user), then double-check
+            # Free :3000 from any owner (root or user)
             PIDS="$(sudo ss -lntp | awk '/:3000[[:space:]]/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
-            for p in $PIDS; do
-              sudo kill -TERM "$p" || true
-            done
+            for p in $PIDS; do sudo kill -TERM "$p" || true; done
             sleep 1
-            for p in $PIDS; do
-              sudo kill -0 "$p" 2>/dev/null && sudo kill -9 "$p" || true
-            done
+            for p in $PIDS; do sudo kill -0 "$p" 2>/dev/null && sudo kill -9 "$p" || true; done
 
-            # 3) Start via root-owned PM2 with dotenv preload
-            DOTENV_CONFIG_PATH="${{ secrets.VPS_PATH }}/.env" \
+            # Start via root-owned PM2 with dotenv preload
+            DOTENV_CONFIG_PATH="${PWD}/.env" \
             sudo pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
               --interpreter node --interpreter-args "-r dotenv/config"
             sudo pm2 save || true
             sudo pm2 ls || true
 
-            # 4) Assert "online"
+            # Assert "online"
             sudo pm2 describe "${{ secrets.PM2_NAME }}" | grep -Eiq 'status[[:space:]]*│[[:space:]]*online'
 
-            # 5) Resolve PORT safely (do NOT fail if PORT missing under pipefail)
+            # Resolve PORT safely (do NOT fail if PORT is missing)
             PORT="${PORT:-}"
             if [ -z "$PORT" ] && [ -f "./.env" ]; then
               PORT="$( (grep -E '^PORT=' "./.env" || true) | tail -1 | cut -d= -f2 | tr -d '\r' )"
@@ -130,7 +134,7 @@ jobs:
             PORT="${PORT:-3000}"
             echo "PORT=$PORT"
 
-            # 6) Readiness (accept 200 or 401)
+            # Readiness (accept 200 or 401)
             echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
             ready=0
             for i in $(seq 1 90); do
@@ -151,7 +155,7 @@ jobs:
               exit 1
             fi
 
-            # 7) Post-deploy info
+            # Post-deploy info
             sudo pm2 ls || true
             echo "Deployed commit: ${GITHUB_SHA}"
             echo "PM2 app: ${{ secrets.PM2_NAME }}"
@@ -277,6 +281,7 @@ jobs:
             a4.headers
             a4.bin
           if-no-files-found: ignore
+
 
 
 
