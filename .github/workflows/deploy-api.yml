@@ -1,111 +1,108 @@
-name: Install prod deps & start (pm2 + dotenv preload) + readiness (diagnostic)
-  uses: appleboy/ssh-action@v1.0.3
-  with:
-    host:     ${{ secrets.VPS_HOST }}
-    username: ${{ secrets.VPS_USER }}
-    key:      ${{ secrets.VPS_SSH_KEY }}
-    script_stop: true
-    envs: GITHUB_SHA
-    script: |
-      set -euo pipefail
-      echo "::group::Env + paths"
-      BASE="${{ secrets.VPS_PATH }}"; echo "BASE=$BASE"
-      RELS="${BASE}/releases"
-      REL="${RELS}/${GITHUB_SHA}"; echo "REL=$REL"
-      CUR="${BASE}/current"; echo "CUR=$CUR"
-      echo "::endgroup::"
+      # --- Install prod deps, link .env, switch symlink, PM2 start with dotenv, readiness (diagnostic), auto-rollback ---
+      - name: Install prod deps & start (pm2 + dotenv preload) + readiness (diagnostic)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
+          envs: GITHUB_SHA
+          script: |
+            set -euo pipefail
+            echo "::group::Env + paths"
+            BASE="${{ secrets.VPS_PATH }}"; echo "BASE=$BASE"
+            RELS="${BASE}/releases"
+            REL="${RELS}/${GITHUB_SHA}"; echo "REL=$REL"
+            CUR="${BASE}/current"; echo "CUR=$CUR"
+            echo "::endgroup::"
 
-      echo "::group::Install deps in release"
-      cd "$REL"
-      NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
-      [ -d node_modules/dotenv ] || npm i dotenv@^16 --no-audit --no-fund
-      echo "::endgroup::"
+            echo "::group::Install deps in release"
+            cd "$REL"
+            NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
+            [ -d node_modules/dotenv ] || npm i dotenv@^16 --no-audit --no-fund
+            echo "::endgroup::"
 
-      echo "::group::Flip current + link .env"
-      [ -f "${BASE}/.env" ] && ln -sfn "${BASE}/.env" "${REL}/.env" || true
-      ln -sfn "$REL" "$CUR"
-      echo "current -> $(readlink -f "$CUR")"
-      echo "::endgroup::"
+            echo "::group::Flip current + link .env"
+            [ -f "${BASE}/.env" ] && ln -sfn "${BASE}/.env" "${REL}/.env" || true
+            ln -sfn "$REL" "$CUR"
+            echo "current -> $(readlink -f "$CUR")"
+            echo "::endgroup::"
 
-      echo "::group::Free :3000 (avoid stray listeners)"
-      PIDS="$(ss -lntp | awk '/:3000/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
-      for p in $PIDS; do
-        echo "killing pid=$p"
-        kill -TERM "$p" || true
-        sleep 1
-        kill -0 "$p" 2>/dev/null && kill -9 "$p" || true
-      done
-      echo "::endgroup::"
+            echo "::group::Free :3000 (avoid stray listeners)"
+            PIDS="$(ss -lntp | awk '/:3000/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
+            for p in $PIDS; do
+              echo "killing pid=$p"
+              kill -TERM "$p" || true
+              sleep 1
+              kill -0 "$p" 2>/dev/null && kill -9 "$p" || true
+            done
+            echo "::endgroup::"
 
-      echo "::group::Start PM2 with dotenv preload"
-      cd "$CUR"
-      pm2 delete "${{ secrets.PM2_NAME }}" || true
-      DOTENV_CONFIG_PATH="${BASE}/.env" \
-      pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
-        --interpreter node --interpreter-args "-r dotenv/config"
-      pm2 save || true
-      pm2 ls || true
-      # Assert it's online or bail early with logs
-      if ! pm2 describe "${{ secrets.PM2_NAME }}" | grep -q 'status\s*│ online' ; then
-        echo "❌ PM2 app is not online immediately after start"; pm2 describe "${{ secrets.PM2_NAME }}" || true
-        pm2 logs "${{ secrets.PM2_NAME }}" --lines 120 --raw || true
-        exit 1
-      fi
-      echo "::endgroup::"
+            echo "::group::Start PM2 with dotenv preload"
+            cd "$CUR"
+            pm2 delete "${{ secrets.PM2_NAME }}" || true
+            DOTENV_CONFIG_PATH="${BASE}/.env" \
+            pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
+              --interpreter node --interpreter-args "-r dotenv/config"
+            pm2 save || true
+            pm2 ls || true
+            if ! pm2 describe "${{ secrets.PM2_NAME }}" | grep -q 'status\s*│ online' ; then
+              echo "❌ PM2 app is not online immediately after start"; pm2 describe "${{ secrets.PM2_NAME }}" || true
+              pm2 logs "${{ secrets.PM2_NAME }}" --lines 120 --raw || true
+              exit 1
+            fi
+            echo "::endgroup::"
 
-      # Resolve port (env → .env → 3000)
-      PORT="${PORT:-}"
-      if [ -z "$PORT" ] && [ -f "${BASE}/.env" ]; then
-        PORT="$(grep -E '^PORT=' "${BASE}/.env" | tail -1 | cut -d= -f2 | tr -d '\r')"
-      fi
-      PORT="${PORT:-3000}"
-      echo "PORT=$PORT"
+            PORT="${PORT:-}"
+            if [ -z "$PORT" ] && [ -f "${BASE}/.env" ]; then
+              PORT="$(grep -E '^PORT=' "${BASE}/.env" | tail -1 | cut -d= -f2 | tr -d '\r')"
+            fi
+            PORT="${PORT:-3000}"
+            echo "PORT=$PORT"
 
-      echo "::group::Readiness probe + diagnostics"
-      echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
-      ready=0
-      for i in $(seq 1 90); do
-        # try curl
-        code="$(curl -s -D /tmp/hh -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || true)"
-        if [ -z "$code" ] || [ "$code" = "000" ]; then
-          # try wget headers
-          code="$(wget -qO- --server-response "http://127.0.0.1:${PORT}/healthz" 2>&1 | awk '/^  HTTP/{print $2; exit}' || true)"
-        fi
-        code="${code:-000}"
-        echo "healthz try #$i: HTTP ${code}"
-        if [ "$code" = "200" ] || [ "$code" = "401" ]; then ready=1; break; fi
-        sleep 1
-      done
+            echo "::group::Readiness probe + diagnostics"
+            echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
+            ready=0
+            for i in $(seq 1 90); do
+              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" 2>/dev/null || true)"
+              if [ -z "$code" ] || [ "$code" = "000" ]; then
+                code="$(wget -qO- --server-response "http://127.0.0.1:${PORT}/healthz" 2>&1 | awk '/^  HTTP/{print $2; exit}' || true)"
+              fi
+              code="${code:-000}"
+              echo "healthz try #$i: HTTP ${code}"
+              if [ "$code" = "200" ] || [ "$code" = "401" ]; then ready=1; break; fi
+              sleep 1
+            done
 
-      if [ "$ready" -ne 1 ]; then
-        echo "❌ Not ready; who is listening on :${PORT}?"
-        ss -lntp || true
-        echo "--- pm2 describe ---"
-        pm2 describe "${{ secrets.PM2_NAME }}" || true
-        echo "--- last 200 log lines ---"
-        pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
+            if [ "$ready" -ne 1 ]; then
+              echo "❌ Not ready; who is listening on :${PORT}?"
+              ss -lntp || true
+              echo "--- pm2 describe ---"
+              pm2 describe "${{ secrets.PM2_NAME }}" || true
+              echo "--- last 200 log lines ---"
+              pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
 
-        # rollback if we have a previous good
-        PREV="$(readlink -f "$CUR" || true)"
-        if [ -n "$PREV" ] && [ -d "$PREV" ] && [ "$PREV" != "$REL" ]; then
-          echo "↩️  Rolling back symlink to previous release"
-          ln -sfn "$PREV" "$CUR"
-          cd "$CUR"
-          pm2 delete "${{ secrets.PM2_NAME }}" || true
-          DOTENV_CONFIG_PATH="${BASE}/.env" \
-          pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
-            --interpreter node --interpreter-args "-r dotenv/config"
-          pm2 save || true
-        else
-          echo "No previous release to roll back to."
-        fi
-        exit 1
-      fi
-      echo "::endgroup::"
+              PREV="$(readlink -f "$CUR" || true)"
+              if [ -n "$PREV" ] && [ -d "$PREV" ] && [ "$PREV" != "$REL" ]; then
+                echo "↩️  Rolling back symlink to previous release"
+                ln -sfn "$PREV" "$CUR"
+                cd "$CUR"
+                pm2 delete "${{ secrets.PM2_NAME }}" || true
+                DOTENV_CONFIG_PATH="${BASE}/.env" \
+                pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
+                  --interpreter node --interpreter-args "-r dotenv/config"
+                pm2 save || true
+              else
+                echo "No previous release to roll back to."
+              fi
+              exit 1
+            fi
+            echo "::endgroup::"
 
-      echo "::group::Keep 5 latest releases"
-      ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
-      echo "::endgroup::"
+            echo "::group::Keep 5 latest releases"
+            ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
+            echo "::endgroup::"
+
 
 
 
