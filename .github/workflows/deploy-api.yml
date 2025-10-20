@@ -8,7 +8,6 @@ on:
       - "**/*.png"
       - "**/*.jpg"
       - "**/*.svg"
-      - ".github/**"
   workflow_dispatch:
 
 concurrency:
@@ -20,7 +19,6 @@ permissions:
 
 env:
   NODE_VERSION: "20.x"
-  # Keep these names stable; values come from repo/org secrets
 
 jobs:
   deploy:
@@ -36,15 +34,15 @@ jobs:
         id: rel
         run: |
           echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          date -u +"%Y-%m-%dT%H:%M:%SZ"
           echo "ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+          date -u +"%Y-%m-%dT%H:%M:%SZ"
 
       - name: Node setup
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Create release directory & upload sources
+      - name: Upload sources to release dir
         uses: appleboy/scp-action@v0.1.7
         with:
           host:     ${{ secrets.VPS_HOST }}
@@ -65,7 +63,6 @@ jobs:
           envs: GITHUB_SHA
           script: |
             set -euo pipefail
-            # On any error, print the failing line and useful context
             trap 'ret=$?; echo "::error::SSH script failed on line ${LINENO} (exit=$ret)"; pm2 describe "${{ secrets.PM2_NAME }}" || true; pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true; ss -lntp || true; exit $ret' ERR
             set -x
 
@@ -74,25 +71,20 @@ jobs:
             REL="${RELS}/${GITHUB_SHA}"
             CUR="${BASE}/current"
 
-            # Ensure release dir exists and move in
             mkdir -p "$REL"
             cd "$REL"
 
-            # Install production deps
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
             [ -d node_modules/dotenv ] || npm i dotenv@^16 --no-audit --no-fund
 
-            # Link env and activate current -> this release
             [ -f "${BASE}/.env" ] && ln -sfn "${BASE}/.env" "${REL}/.env" || true
             ln -sfn "$REL" "$CUR"
 
-            # Free :3000 if still bound (defensive against stray processes)
+            # Free :3000 if anything is bound
             PIDS="$(ss -lntp | awk '/:3000/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
             for p in $PIDS; do kill -TERM "$p" || true; sleep 1; kill -0 "$p" 2>/dev/null && kill -9 "$p" || true; done
 
             cd "$CUR"
-
-            # Start via PM2 with dotenv preload; ensure single daemon under deploy user
             pm2 delete "${{ secrets.PM2_NAME }}" || true
             DOTENV_CONFIG_PATH="${BASE}/.env" \
             pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
@@ -100,10 +92,10 @@ jobs:
             pm2 save || true
             pm2 ls || true
 
-            # Assert "online" (trap prints context if this fails)
+            # Assert online (trap will print context if this fails)
             pm2 describe "${{ secrets.PM2_NAME }}" | grep -Eiq 'status[[:space:]]*│[[:space:]]*online'
 
-            # Resolve PORT (default 3000) without echoing secrets
+            # Resolve PORT (default 3000)
             PORT="${PORT:-}"
             if [ -z "$PORT" ] && [ -f "${BASE}/.env" ]; then
               PORT="$(grep -E '^PORT=' "${BASE}/.env" | tail -1 | cut -d= -f2 | tr -d '\r')"
@@ -111,7 +103,7 @@ jobs:
             PORT="${PORT:-3000}"
             echo "PORT=$PORT"
 
-            # Readiness probe (accept 200 or 401)
+            # Readiness: accept 200 or 401
             echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
             ready=0
             for i in $(seq 1 90); do
@@ -150,22 +142,19 @@ jobs:
             # Trim old releases (keep most recent 5)
             ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
 
-            # Trim old releases (keep most recent 5)
-      ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
-
-    - name: Post-deploy: print URL and PM2 app list
-      if: always()
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host:     ${{ secrets.VPS_HOST }}
-        username: ${{ secrets.VPS_USER }}
-        key:      ${{ secrets.VPS_SSH_KEY }}
-        script_stop: false
-        script: |
-          set -euo pipefail
-          pm2 ls || true
-          echo "Deployed commit: ${GITHUB_SHA}"
-          echo "PM2 app: ${{ secrets.PM2_NAME }}"
+      - name: Post-deploy: print URL and PM2 app list
+        if: always()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          script_stop: false
+          script: |
+            set -euo pipefail
+            pm2 ls || true
+            echo "Deployed commit: ${GITHUB_SHA}"
+            echo "PM2 app: ${{ secrets.PM2_NAME }}"
 
 
 
