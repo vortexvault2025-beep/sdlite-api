@@ -1,5 +1,5 @@
 # SD-Lite API — Deploy + PDF smokes + Routing gate
-# Single PM2 daemon (root), ownership fix for npm ci, safe PORT detection.
+# Hardened: single user-owned PM2, passwordless sudo (limited cmds), safe PORT detection.
 
 name: Deploy API
 
@@ -71,7 +71,7 @@ jobs:
             echo "No API host/base configured"; exit 1
           fi
 
-      # --- Ship code to VPS target path (matches last known-good layout) ---
+      # --- Ship code to VPS target path ---
       - name: Upload to VPS
         uses: easingthemes/ssh-deploy@v5.1.0
         with:
@@ -82,51 +82,49 @@ jobs:
           ARGS: "-az --delete"
           EXCLUDE: ".git,.github,node_modules,*.log"
 
-      # --- Single-daemon PM2 (root) + ownership fix + readiness ---
-      - name: Install prod deps & restart pm2 (root) + readiness
+      # --- Single user-owned PM2 + ownership fix + readiness ---
+      - name: Install prod deps & restart pm2 (user PM2) + readiness
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
+          username: ${{ secrets.VPS_USER }}   # e.g. ubuntu
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             set -euo pipefail
-            trap 'ret=$?; echo "::error::SSH script failed on line ${LINENO} (exit=$ret)"; sudo pm2 describe "${{ secrets.PM2_NAME }}" || true; sudo pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true; sudo ss -lntp || true; exit $ret' ERR
+            trap 'ret=$?; echo "::error::SSH script failed on line ${LINENO} (exit=$ret)"; pm2 describe "${{ secrets.PM2_NAME }}" || true; pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true; ss -lntp || true; exit $ret' ERR
             set -x
 
+            echo "whoami=$(whoami)"
             cd "${{ secrets.VPS_PATH }}"
 
-            # Fix ownership (previous runs created root-owned node_modules)
-            # Make everything writable by the SSH user BEFORE npm ci
-            sudo chown -R "${USER}:${USER}" .
+            # 0) Ensure passwordless sudo is active (prevents prompts)
+            sudo -n /usr/bin/pm2 -v >/dev/null || { echo "::error::NOPASSWD sudo missing for $(whoami)"; exit 98; }
 
-            # Clean any root-owned node_modules to avoid EACCES
-            [ -d node_modules ] && sudo rm -rf node_modules || true
-
-            NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
-
-            # Ensure only root-owned PM2 will run this app
-            pm2 delete "${{ secrets.PM2_NAME }}" || true     # kill any user-owned app
-            pm2 kill || true                                  # stop user-owned PM2 daemon
-            sudo pm2 delete "${{ secrets.PM2_NAME }}" || true # remove from root-owned PM2 (avoid respawn)
-
-            # Free :3000 from any owner (root or user)
+            # 1) Kill any root-owned PM2 and free :3000 (avoid port/daemon fights)
+            sudo pm2 delete "${{ secrets.PM2_NAME }}" || true
+            sudo pm2 kill || true
             PIDS="$(sudo ss -lntp | awk '/:3000[[:space:]]/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
             for p in $PIDS; do sudo kill -TERM "$p" || true; done
             sleep 1
             for p in $PIDS; do sudo kill -0 "$p" 2>/dev/null && sudo kill -9 "$p" || true; done
 
-            # Start via root-owned PM2 with dotenv preload
+            # 2) Normalize ownership from any past root runs & install clean deps
+            sudo chown -R "$(whoami)":"$(whoami)" .
+            [ -d node_modules ] && rm -rf node_modules || true
+            NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
+
+            # 3) Start user-owned PM2 (dotenv preload)
+            pm2 delete "${{ secrets.PM2_NAME }}" || true
             DOTENV_CONFIG_PATH="${PWD}/.env" \
-            sudo pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
+            pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
               --interpreter node --interpreter-args "-r dotenv/config"
-            sudo pm2 save || true
-            sudo pm2 ls || true
+            pm2 save || true
+            pm2 ls || true
 
-            # Assert "online"
-            sudo pm2 describe "${{ secrets.PM2_NAME }}" | grep -Eiq 'status[[:space:]]*│[[:space:]]*online'
+            # 4) Assert "online"
+            pm2 describe "${{ secrets.PM2_NAME }}" | grep -Eiq 'status[[:space:]]*│[[:space:]]*online'
 
-            # Resolve PORT safely (do NOT fail if PORT is missing)
+            # 5) Resolve PORT safely (no pipefail abort on missing PORT)
             PORT="${PORT:-}"
             if [ -z "$PORT" ] && [ -f "./.env" ]; then
               PORT="$( (grep -E '^PORT=' "./.env" || true) | tail -1 | cut -d= -f2 | tr -d '\r' )"
@@ -134,7 +132,7 @@ jobs:
             PORT="${PORT:-3000}"
             echo "PORT=$PORT"
 
-            # Readiness (accept 200 or 401)
+            # 6) Readiness (accept 200 or 401)
             echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
             ready=0
             for i in $(seq 1 90); do
@@ -149,14 +147,14 @@ jobs:
             done
             if [ "$ready" -ne 1 ]; then
               echo "Not ready; who is listening on :${PORT}?"
-              sudo ss -lntp || true
-              sudo pm2 describe "${{ secrets.PM2_NAME }}" || true
-              sudo pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
+              ss -lntp || true
+              pm2 describe "${{ secrets.PM2_NAME }}" || true
+              pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
               exit 1
             fi
 
-            # Post-deploy info
-            sudo pm2 ls || true
+            # 7) Post-deploy info
+            pm2 ls || true
             echo "Deployed commit: ${GITHUB_SHA}"
             echo "PM2 app: ${{ secrets.PM2_NAME }}"
 
