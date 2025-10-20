@@ -62,6 +62,7 @@ jobs:
           envs: GITHUB_SHA
           script: |
             set -euo pipefail
+            # Print failing line + PM2/ports on any error
             trap 'ret=$?; echo "::error::SSH script failed on line ${LINENO} (exit=$ret)"; pm2 describe "${{ secrets.PM2_NAME }}" || true; pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true; ss -lntp || true; exit $ret' ERR
             set -x
 
@@ -76,10 +77,11 @@ jobs:
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
             [ -d node_modules/dotenv ] || npm i dotenv@^16 --no-audit --no-fund
 
+            # Link env and switch current -> this release
             [ -f "${BASE}/.env" ] && ln -sfn "${BASE}/.env" "${REL}/.env" || true
             ln -sfn "$REL" "$CUR"
 
-            # Free :3000 if anything is bound
+            # Free :3000 if bound
             PIDS="$(ss -lntp | awk '/:3000/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
             for p in $PIDS; do kill -TERM "$p" || true; sleep 1; kill -0 "$p" 2>/dev/null && kill -9 "$p" || true; done
 
@@ -91,7 +93,7 @@ jobs:
             pm2 save || true
             pm2 ls || true
 
-            # Assert online (trap will print context if this fails)
+            # Assert online (trap prints context if grep fails)
             pm2 describe "${{ secrets.PM2_NAME }}" | grep -Eiq 'status[[:space:]]*│[[:space:]]*online'
 
             # Resolve PORT (default 3000)
@@ -141,19 +143,10 @@ jobs:
             # Trim old releases (keep most recent 5)
             ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
 
-      - name: Post-deploy: print URL and PM2 app list
-        if: ${{ always() }}
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host:     ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            set -euo pipefail
+            # Post-deploy info (kept in same SSH step to avoid YAML dedent issues)
             pm2 ls || true
             echo "Deployed commit: ${GITHUB_SHA}"
             echo "PM2 app: ${{ secrets.PM2_NAME }}"
-
 
 
 
