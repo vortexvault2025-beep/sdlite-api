@@ -17,8 +17,8 @@ function normalizePostcode(lines = []) {
 }
 
 // canonical variant ids (A6)
-const ENV_SD  = (process.env.A6_VARIANT_SD_1PM        || 'a6_sd_1pm_v1').toLowerCase();
-const ENV_TRK = (process.env.A6_VARIANT_TRK24_NOSIG   || 'a6_trk24_nosig_v1').toLowerCase();
+const ENV_SD  = (process.env.A6_VARIANT_SD_1PM      || 'a6_sd_1pm_v1').toLowerCase();
+const ENV_TRK = (process.env.A6_VARIANT_TRK24_NOSIG || 'a6_trk24_nosig_v1').toLowerCase();
 const VALID_VARIANTS = new Set([ENV_SD, ENV_TRK]);
 
 // nickname → canonical id
@@ -33,7 +33,7 @@ const ALIASES = new Map([
   ['tracked24',     ENV_TRK],
   ['tracked',       ENV_TRK],
   ['a6_trk24',      ENV_TRK],
-  ['trk',           ENV_TRK]
+  ['trk',           ENV_TRK],
 ]);
 
 function resolveVariant(payload = {}) {
@@ -74,14 +74,14 @@ async function enrichTilesIfMissing(payload) {
       return payload;
     }
 
-    // non‑fatal: queue for review
+    // non-fatal: queue for review
     await supa.from('postcodes_needs_review').insert({
       id: `${Date.now()}-${key}`, postcode_key: key, status: 'pending'
     });
 
     return payload;
   } catch {
-    return payload; // fail‑soft
+    return payload; // fail-soft
   }
 }
 
@@ -102,7 +102,7 @@ router.post('/api/labels/render-a6', express.json(), async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: 'INVALID_VARIANT',
-        allowed: Array.from(VALID_VARIANTS)
+        allowed: Array.from(VALID_VARIANTS),
       });
     }
 
@@ -118,12 +118,18 @@ router.post('/api/labels/render-a6', express.json(), async (req, res) => {
     // 4) render
     const pdfBuffer = await renderA6(payload);
 
-    // 5) hash + optional save
+    // 5) hash + optional save (storage + audit)
     const sha256 = crypto.createHash('sha256').update(pdfBuffer).digest('hex');
     res.setHeader('X-Label-SHA256', sha256);
 
+    // save gate: STORE_UPLOAD=1 OR ?save=1
     const shouldSave = (process.env.STORE_UPLOAD === '1') || (String(req.query.save) === '1');
+
+    // optional signed URL from storage to include in audit row
+    let savedUrl = null;
+
     if (shouldSave) {
+      // 5a) (best-effort) store PDF, upsert orders table, set headers
       try {
         const supa = getSupabase();
         await supa.storage.createBucket('labels', { public: false }).catch(() => {});
@@ -131,21 +137,56 @@ router.post('/api/labels/render-a6', express.json(), async (req, res) => {
 
         await supa.storage.from('labels').upload(path, pdfBuffer, {
           contentType: 'application/pdf',
-          upsert: true
+          upsert: true,
         });
 
-        await supa.from('orders').upsert({
-          id: rawId, pdf_sha256: sha256, storage_path: path
-        }, { onConflict: 'id' });
+        await supa.from('orders').upsert(
+          { id: rawId, pdf_sha256: sha256, storage_path: path },
+          { onConflict: 'id' }
+        );
 
         const { data: signed } =
           await supa.storage.from('labels').createSignedUrl(path, 60 * 60 * 24 * 7);
 
-        if (signed?.signedUrl) res.setHeader('X-Signed-Url', signed.signedUrl);
+        if (signed?.signedUrl) {
+          savedUrl = signed.signedUrl;
+          res.setHeader('X-Signed-Url', signed.signedUrl);
+        }
         res.setHeader('X-Label-Saved', '1');
-      } catch {
+      } catch (e) {
+        console.error('[storage save failed]', e?.message || e);
         // never fail the download if storage is unavailable
         res.setHeader('X-Label-Saved', '0');
+      }
+
+      // 5b) (independent) write audit row with REQUIRED sha256 (do not block response)
+      try {
+        const supa = getSupabase();
+        const { data, error } = await supa
+          .from('label_audit')
+          .insert({
+            order_id: rawId,
+            sha256,                 // REQUIRED by DB (NOT NULL)
+            bytes: pdfBuffer.length,
+            variant: resolved,
+            service: 'api',
+            saved_url: savedUrl,    // may be null; nullable column
+          })
+          .select('order_id')       // get something back on success
+          .single();
+
+        if (error) {
+          console.error('[audit insert failed]', {
+            code: error.code,
+            message: error.message,
+            details: error.details,
+            hint: error.hint,
+          });
+        } else {
+          console.log('[audit insert ok]', data?.order_id || rawId);
+        }
+      } catch (e) {
+        console.error('[audit insert threw]', e?.message || e);
       }
     }
 
