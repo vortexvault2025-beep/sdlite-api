@@ -125,7 +125,11 @@ jobs:
             # Flip 'current' symlink
             ln -sfn "$REL" "$CUR"
 
-            # Start PM2 with dotenv preloaded (no sudo; same as our manual run)
+            # Free :3000 defensively (avoid stray listeners)
+            PIDS="$(ss -lntp | awk '/:3000/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
+            for p in $PIDS; do kill -TERM "$p" || true; sleep 1; kill -0 "$p" 2>/dev/null && kill -9 "$p" || true; done
+
+            # Start PM2 with dotenv preloaded (no sudo; same as manual)
             cd "$CUR"
             pm2 delete "${{ secrets.PM2_NAME }}" || true
             DOTENV_CONFIG_PATH="${BASE}/.env" \
@@ -140,20 +144,15 @@ jobs:
             fi
             PORT="${PORT:-3000}"
 
-            # Readiness poll (prefer curl, fallback to wget); accept 200 or 401
-            get_code() {
-              local c
-              c="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" 2>/dev/null || true)"
-              if [ -z "$c" ] || [ "$c" = "000" ]; then
-                c="$(wget -qO- --server-response "http://127.0.0.1:${PORT}/healthz" 2>&1 | awk '/^  HTTP/{print $2; exit}' || true)"
-              fi
-              echo "${c:-000}"
-            }
-
+            # POSIX-safe readiness poll; accept 200 or 401
             echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
             ready=0
             for i in $(seq 1 90); do
-              code="$(get_code)"
+              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" 2>/dev/null || true)"
+              if [ -z "$code" ] || [ "$code" = "000" ]; then
+                code="$(wget -qO- --server-response "http://127.0.0.1:${PORT}/healthz" 2>&1 | awk '/^  HTTP/{print $2; exit}' || true)"
+              fi
+              code="${code:-000}"
               echo "healthz try #$i: HTTP ${code}"
               if [ "$code" = "200" ] || [ "$code" = "401" ]; then ready=1; break; fi
               sleep 1
@@ -282,7 +281,7 @@ jobs:
             audit.headers
             audit.bin
           if-no-files-found: ignore
-          
+
 
 
 
