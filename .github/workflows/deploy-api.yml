@@ -1,286 +1,112 @@
-# .github/workflows/deploy-api.yml
-name: Deploy API
+# --- Install prod deps, link .env, switch symlink, PM2 start with dotenv, readiness (diagnostic), auto-rollback ---
+- name: Install prod deps & start (pm2 + dotenv preload) + readiness (diagnostic)
+  uses: appleboy/ssh-action@v1.0.3
+  with:
+    host:     ${{ secrets.VPS_HOST }}
+    username: ${{ secrets.VPS_USER }}
+    key:      ${{ secrets.VPS_SSH_KEY }}
+    script_stop: true
+    envs: GITHUB_SHA
+    script: |
+      set -euo pipefail
+      echo "::group::Env + paths"
+      BASE="${{ secrets.VPS_PATH }}"; echo "BASE=$BASE"
+      RELS="${BASE}/releases"
+      REL="${RELS}/${GITHUB_SHA}"; echo "REL=$REL"
+      CUR="${BASE}/current"; echo "CUR=$CUR"
+      echo "::endgroup::"
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch: {}
+      echo "::group::Install deps in release"
+      cd "$REL"
+      NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
+      [ -d node_modules/dotenv ] || npm i dotenv@^16 --no-audit --no-fund
+      echo "::endgroup::"
 
-permissions:
-  contents: read
+      echo "::group::Flip current + link .env"
+      [ -f "${BASE}/.env" ] && ln -sfn "${BASE}/.env" "${REL}/.env" || true
+      ln -sfn "$REL" "$CUR"
+      echo "current -> $(readlink -f "$CUR")"
+      echo "::endgroup::"
 
-concurrency:
-  group: api-deploy-${{ github.ref }}
-  cancel-in-progress: true
+      echo "::group::Free :3000 (avoid stray listeners)"
+      PIDS="$(ss -lntp | awk '/:3000/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
+      for p in $PIDS; do
+        echo "killing pid=$p"
+        kill -TERM "$p" || true
+        sleep 1
+        kill -0 "$p" 2>/dev/null && kill -9 "$p" || true
+      done
+      echo "::endgroup::"
 
-jobs:
-  build-deploy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+      echo "::group::Start PM2 with dotenv preload"
+      cd "$CUR"
+      pm2 delete "${{ secrets.PM2_NAME }}" || true
+      DOTENV_CONFIG_PATH="${BASE}/.env" \
+      pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
+        --interpreter node --interpreter-args "-r dotenv/config"
+      pm2 save || true
+      pm2 ls || true
+      # Assert it's online or bail early with logs
+      if ! pm2 describe "${{ secrets.PM2_NAME }}" | grep -q 'status\s*│ online' ; then
+        echo "❌ PM2 app is not online immediately after start"; pm2 describe "${{ secrets.PM2_NAME }}" || true
+        pm2 logs "${{ secrets.PM2_NAME }}" --lines 120 --raw || true
+        exit 1
+      fi
+      echo "::endgroup::"
 
-    steps:
-      # --- Checkout & build on runner ---
-      - name: Checkout
-        uses: actions/checkout@v4
-        with: { fetch-depth: 1 }
+      # Resolve port (env → .env → 3000)
+      PORT="${PORT:-}"
+      if [ -z "$PORT" ] && [ -f "${BASE}/.env" ]; then
+        PORT="$(grep -E '^PORT=' "${BASE}/.env" | tail -1 | cut -d= -f2 | tr -d '\r')"
+      fi
+      PORT="${PORT:-3000}"
+      echo "PORT=$PORT"
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
+      echo "::group::Readiness probe + diagnostics"
+      echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
+      ready=0
+      for i in $(seq 1 90); do
+        # try curl
+        code="$(curl -s -D /tmp/hh -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || true)"
+        if [ -z "$code" ] || [ "$code" = "000" ]; then
+          # try wget headers
+          code="$(wget -qO- --server-response "http://127.0.0.1:${PORT}/healthz" 2>&1 | awk '/^  HTTP/{print $2; exit}' || true)"
+        fi
+        code="${code:-000}"
+        echo "healthz try #$i: HTTP ${code}"
+        if [ "$code" = "200" ] || [ "$code" = "401" ]; then ready=1; break; fi
+        sleep 1
+      done
 
-      - name: Install deps
-        run: npm ci
+      if [ "$ready" -ne 1 ]; then
+        echo "❌ Not ready; who is listening on :${PORT}?"
+        ss -lntp || true
+        echo "--- pm2 describe ---"
+        pm2 describe "${{ secrets.PM2_NAME }}" || true
+        echo "--- last 200 log lines ---"
+        pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
 
-      - name: Build (non-blocking)
-        run: npm run build || true
+        # rollback if we have a previous good
+        PREV="$(readlink -f "$CUR" || true)"
+        if [ -n "$PREV" ] && [ -d "$PREV" ] && [ "$PREV" != "$REL" ]; then
+          echo "↩️  Rolling back symlink to previous release"
+          ln -sfn "$PREV" "$CUR"
+          cd "$CUR"
+          pm2 delete "${{ secrets.PM2_NAME }}" || true
+          DOTENV_CONFIG_PATH="${BASE}/.env" \
+          pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
+            --interpreter node --interpreter-args "-r dotenv/config"
+          pm2 save || true
+        else
+          echo "No previous release to roll back to."
+        fi
+        exit 1
+      fi
+      echo "::endgroup::"
 
-      # --- Sanity (no secret values printed) ---
-      - name: Debug inputs (no secrets printed)
-        run: |
-          test -n "${{ secrets.VPS_HOST }}" && echo "VPS_HOST=OK" || (echo "VPS_HOST=MISSING"; exit 1)
-          test -n "${{ secrets.VPS_USER }}" && echo "VPS_USER=OK" || (echo "VPS_USER=MISSING"; exit 1)
-          test -n "${{ secrets.VPS_PATH }}" && echo "VPS_PATH=OK" || (echo "VPS_PATH=MISSING"; exit 1)
-          test -n "${{ secrets.VPS_SSH_KEY }}" && echo "VPS_SSH_KEY=OK" || (echo "VPS_SSH_KEY=MISSING"; exit 1)
-          test -n "${{ secrets.PM2_NAME }}" && echo "PM2_NAME=OK" || (echo "PM2_NAME=MISSING"; exit 1)
-          test -n "${{ secrets.X_API_KEY }}" && echo "X_API_KEY=OK" || echo "X_API_KEY=MISSING"
-          if [ -n "${{ vars.API_HOST }}" ] || [ -n "${{ secrets.API_HOST }}" ] || [ -n "${{ secrets.API_BASE_URL }}" ]; then
-            echo "API_BASE/HOST present"
-          else
-            echo "API_BASE/HOST MISSING"; exit 1
-          fi
-          if [ -n "${{ secrets.SUPABASE_DB_URL }}" ]; then echo "SUPABASE_DB_URL=SET"; else echo "SUPABASE_DB_URL=NOT SET (routing gate will auto-skip)"; fi
-
-      # --- Resolve public base URL for smokes ---
-      - name: Resolve API base URL (vars → secrets → base_url)
-        run: |
-          if [ -n "${{ vars.API_HOST }}" ]; then
-            echo "URL_BASE=https://${{ vars.API_HOST }}" >> "$GITHUB_ENV"
-          elif [ -n "${{ secrets.API_HOST }}" ]; then
-            echo "URL_BASE=https://${{ secrets.API_HOST }}" >> "$GITHUB_ENV"
-          elif [ -n "${{ secrets.API_BASE_URL }}" ]; then
-            echo "URL_BASE=${{ secrets.API_BASE_URL }}" >> "$GITHUB_ENV"
-          else
-            echo "No API host/base configured"; exit 1
-          fi
-
-      # --- Prepare release dir on VPS ---
-      - name: Prepare release dir on VPS
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host:     ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          script_stop: true
-          envs: GITHUB_SHA
-          script: |
-            set -euo pipefail
-            BASE="${{ secrets.VPS_PATH }}"
-            RELS="${BASE}/releases"
-            REL="${RELS}/${GITHUB_SHA}"
-            mkdir -p "$RELS" "$REL"
-            ( cd "$REL" && touch .ci_w && rm .ci_w ) || { echo "ERR: cannot write to $REL"; exit 1; }
-
-      # --- Upload build to per-release path ---
-      - name: Upload to VPS (per-release)
-        uses: easingthemes/ssh-deploy@v5.1.0
-        with:
-          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
-          REMOTE_HOST:     ${{ secrets.VPS_HOST }}
-          REMOTE_USER:     ${{ secrets.VPS_USER }}
-          TARGET:          ${{ secrets.VPS_PATH }}/releases/${{ github.sha }}/
-          ARGS: "-az --delete"
-          EXCLUDE: ".git,.github,node_modules,*.log"
-
-      # --- Install prod deps, link .env, switch symlink, PM2 start with dotenv, readiness (no sudo), auto-rollback ---
-      - name: Install prod deps & start (pm2 + dotenv preload) + readiness
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host:     ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          script_stop: true
-          envs: GITHUB_SHA
-          script: |
-            set -euo pipefail
-            BASE="${{ secrets.VPS_PATH }}"
-            RELS="${BASE}/releases"
-            REL="${RELS}/${GITHUB_SHA}"
-            CUR="${BASE}/current"
-
-            # Remember previous target for rollback
-            PREV="$(readlink -f "$CUR" || true)"
-
-            # Install production deps in the new release
-            cd "$REL"
-            NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
-
-            # Ensure dotenv exists in this release (safe if omitted by --omit=dev)
-            [ -d node_modules/dotenv ] || npm i dotenv@^16 --no-audit --no-fund
-
-            # Link base .env into current release for local tools
-            [ -f "${BASE}/.env" ] && ln -sfn "${BASE}/.env" "${REL}/.env" || true
-
-            # Flip 'current' symlink
-            ln -sfn "$REL" "$CUR"
-
-            # Free :3000 defensively (avoid stray listeners)
-            PIDS="$(ss -lntp | awk '/:3000/ {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')"
-            for p in $PIDS; do kill -TERM "$p" || true; sleep 1; kill -0 "$p" 2>/dev/null && kill -9 "$p" || true; done
-
-            # Start PM2 with dotenv preloaded (no sudo; same as manual)
-            cd "$CUR"
-            pm2 delete "${{ secrets.PM2_NAME }}" || true
-            DOTENV_CONFIG_PATH="${BASE}/.env" \
-            pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
-              --interpreter node --interpreter-args "-r dotenv/config"
-            pm2 save || true
-
-            # Resolve PORT (env → .env → 3000)
-            PORT="${PORT:-}"
-            if [ -z "$PORT" ] && [ -f "${BASE}/.env" ]; then
-              PORT="$(grep -E '^PORT=' "${BASE}/.env" | tail -1 | cut -d= -f2 | tr -d '\r')"
-            fi
-            PORT="${PORT:-3000}"
-
-            # POSIX-safe readiness poll; accept 200 or 401
-            echo "Polling http://127.0.0.1:${PORT}/healthz (accept 200 or 401) ..."
-            ready=0
-            for i in $(seq 1 90); do
-              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" 2>/dev/null || true)"
-              if [ -z "$code" ] || [ "$code" = "000" ]; then
-                code="$(wget -qO- --server-response "http://127.0.0.1:${PORT}/healthz" 2>&1 | awk '/^  HTTP/{print $2; exit}' || true)"
-              fi
-              code="${code:-000}"
-              echo "healthz try #$i: HTTP ${code}"
-              if [ "$code" = "200" ] || [ "$code" = "401" ]; then ready=1; break; fi
-              sleep 1
-            done
-
-            if [ "$ready" -ne 1 ]; then
-              echo "❌ Not ready; diagnostics + rollback"
-              ss -lntp || true
-              pm2 describe "${{ secrets.PM2_NAME }}" || true
-              pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true
-              if [ -n "$PREV" ] && [ -d "$PREV" ] && [ "$PREV" != "$REL" ]; then
-                echo "↩️  Rolling back to $PREV"
-                ln -sfn "$PREV" "$CUR"
-                cd "$CUR"
-                pm2 delete "${{ secrets.PM2_NAME }}" || true
-                DOTENV_CONFIG_PATH="${BASE}/.env" \
-                pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
-                  --interpreter node --interpreter-args "-r dotenv/config"
-                pm2 save || true
-              else
-                echo "No previous release to roll back to."
-              fi
-              exit 1
-            fi
-
-            # Keep last 5 releases (oldest trimmed)
-            ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
-
-      # --- Public smokes: strict PDF checks ---
-      - name: Smoke A6 (strict PDF checks)
-        run: |
-          set -euo pipefail
-          URL="$URL_BASE/api/labels/render-a6?save=0"
-          BODY='{"variant":"a6_trk24_nosig_v1","orderId":"CI-A6","recipient":{"lines":["A","B","C","SW1A 1AA"]}}'
-          curl -sS -X POST "$URL" \
-            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            --data-binary "$BODY" \
-            -D a6.headers -o a6.bin -w "\nHTTP=%{http_code}\n"
-          grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a6.headers || { sed -n '1,120p' a6.headers; exit 1; }
-          grep -qi '^content-type: *application/pdf' a6.headers || { sed -n '1,120p' a6.headers; exit 1; }
-          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a6.headers || { sed -n '1,120p' a6.headers; exit 1; }
-          head -c 5 a6.bin | grep -q "%PDF-" || { head -c 64 a6.bin | hexdump -C; exit 1; }
-
-      - name: Smoke A4 4-up (strict PDF checks)
-        run: |
-          set -euo pipefail
-          URL="$URL_BASE/api/labels/render-a4-4up?count=1&save=0"
-          BODY='{"variant":"a6_trk24_nosig_v1","orderId":"CI-A4","recipient":{"lines":["A","B","C","SW1A 1AA"]}}'
-          curl -sS -X POST "$URL" \
-            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            --data-binary "$BODY" \
-            -D a4.headers -o a4.bin -w "\nHTTP=%{http_code}\n"
-          grep -qE '^HTTP/2 200|^HTTP/1\.1 200' a4.headers || { sed -n '1,120p' a4.headers; exit 1; }
-          grep -qi '^content-type: *application/pdf' a4.headers || { sed -n '1,120p' a4.headers; exit 1; }
-          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a4.headers || { sed -n '1,120p' a4.headers; exit 1; }
-          head -c 5 a4.bin | grep -q "%PDF-" || { head -c 64 a4.bin | hexdump -C; exit 1; }
-
-      # --- Validate & normalize DB URL on runner ---
-      - name: Validate & normalize SUPABASE_DB_URL (runner only)
-        id: dbnorm
-        run: |
-          set -euo pipefail
-          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
-            echo "no_db=1" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          RAW="${{ secrets.SUPABASE_DB_URL }}"
-          RAW=$(echo "$RAW" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
-          CLEAN=$(echo "$RAW" | awk -F'\\?' '{print $1}')
-          echo "db_url_clean=$CLEAN" >> "$GITHUB_OUTPUT"
-          echo "DB_URL_CLEAN=$CLEAN"  >> "$GITHUB_ENV"
-
-      # --- Audit verify: save=1 must create a DB row ---
-      - name: Audit verify (save=1 + row exists)
-        if: steps.dbnorm.outputs.no_db != '1'
-        run: |
-          set -euo pipefail
-          ORDER="CI-AUDIT-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          URL="$URL_BASE/api/labels/render-a6?save=1"
-          curl -sS -X POST "$URL" \
-            -H "X-Api-Key: ${{ secrets.X_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            --data-binary "{\"variant\":\"a6_trk24_nosig_v1\",\"orderId\":\"$ORDER\",\"recipient\":{\"lines\":[\"A\",\"B\",\"C\",\"SW1A 1AA\"]}}" \
-            -D audit.headers -o audit.bin -w "\nHTTP=%{http_code}\n"
-          head -c 5 audit.bin | grep -q "%PDF-" || { echo "Audit PDF invalid"; exit 1; }
-
-          sudo apt-get update -y >/dev/null
-          sudo apt-get install -y postgresql-client >/dev/null
-          export PGSSLMODE=require
-          for t in 0 2 4 6 8; do
-            sleep "$t"
-            COUNT=$(psql "$DB_URL_CLEAN" -Atc "select count(*) from public.label_audit where order_id='${ORDER}'")
-            echo "label_audit rows for ${ORDER}: $COUNT"
-            [ "${COUNT:-0}" -ge 1 ] && exit 0
-          done
-          echo "Audit row not found for ${ORDER}"
-          exit 1
-
-      # --- Routing integrity gate ---
-      - name: Routing integrity (no null tiles)
-        if: steps.dbnorm.outputs.no_db != '1'
-        run: |
-          set -euo pipefail
-          sudo apt-get update -y >/dev/null
-          sudo apt-get install -y postgresql-client >/dev/null
-          export PGSSLMODE=require PGCONNECT_TIMEOUT=10
-          psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null
-          COUNT=$(psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc \
-            "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
-          echo "Null tile rows: $COUNT"
-          [ "$COUNT" -eq 0 ] || { echo "Routing holes exist. Import mappings before deploy."; exit 1; }
-
-      # --- Preserve artifacts on failure ---
-      - name: Upload smoke artifacts (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: smoke-artifacts
-          path: |
-            a6.headers
-            a6.bin
-            a4.headers
-            a4.bin
-            audit.headers
-            audit.bin
-          if-no-files-found: ignore
+      echo "::group::Keep 5 latest releases"
+      ls -1dt "${RELS}/"* 2>/dev/null | tail -n +6 | xargs -r rm -rf
+      echo "::endgroup::"
 
 
 
