@@ -76,19 +76,20 @@ jobs:
         uses: easingthemes/ssh-deploy@v5.1.0
         with:
           SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
-          REMOTE_HOST: ${{ secrets.VPS_HOST }}
-          REMOTE_USER: ${{ secrets.VPS_USER }}
-          TARGET: ${{ secrets.VPS_PATH }}
+          REMOTE_HOST:     ${{ secrets.VPS_HOST }}
+          REMOTE_USER:     ${{ secrets.VPS_USER }}
+          TARGET:          ${{ secrets.VPS_PATH }}
           ARGS: "-az --delete"
-          EXCLUDE: ".git,.github,node_modules,*.log"
+          EXCLUDE: ".git,.github,node_modules,*.log,releases/**"
 
       # --- Single user-owned PM2 + ownership fix + readiness ---
       - name: Install prod deps & restart pm2 (user PM2) + readiness
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VPS_HOST }}
+          host:     ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}   # e.g. ubuntu
-          key: ${{ secrets.VPS_SSH_KEY }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          envs:     GITHUB_SHA
           script: |
             set -euo pipefail
             trap 'ret=$?; echo "::error::SSH script failed on line ${LINENO} (exit=$ret)"; pm2 describe "${{ secrets.PM2_NAME }}" || true; pm2 logs "${{ secrets.PM2_NAME }}" --lines 200 --raw || true; ss -lntp || true; exit $ret' ERR
@@ -108,7 +109,7 @@ jobs:
             sleep 1
             for p in $PIDS; do sudo kill -0 "$p" 2>/dev/null && sudo kill -9 "$p" || true; done
 
-            # 2) Normalize ownership from any past root runs & install clean deps
+            # 2) Normalize ownership & install clean deps
             sudo chown -R "$(whoami)":"$(whoami)" .
             [ -d node_modules ] && rm -rf node_modules || true
             NODE_ENV=production npm ci --omit=dev --no-audit --no-fund
@@ -153,9 +154,9 @@ jobs:
               exit 1
             fi
 
-            # 7) Post-deploy info
+            # 7) Post-deploy info (safe under set -u)
             pm2 ls || true
-            echo "Deployed commit: ${GITHUB_SHA}"
+            echo "Deployed commit: ${GITHUB_SHA:-unknown}"
             echo "PM2 app: ${{ secrets.PM2_NAME }}"
 
       - name: Warm-up wait
@@ -203,82 +204,7 @@ jobs:
         id: dbnorm
         run: |
           set -euo pipefail
-          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
-            echo "no_db=1" >> "$GITHUB_OUTPUT"
-            echo "Skipping DB checks: SUPABASE_DB_URL not set."
-            exit 0
-          fi
-          RAW="${{ secrets.SUPABASE_DB_URL }}"
-          RAW=$(echo "$RAW" | tr -d '\r' | sed -E 's/^["'\'' ]+//; s/["'\'' ]+$//')
-          CREDS_HOST=$(echo "$RAW" | awk -F'://' '{print $2}')
-          CREDS=$(echo "$CREDS_HOST" | awk -F'@' '{print $1}')
-          HOSTPORTPATHQS=$(echo "$CREDS_HOST" | awk -F'@' '{print $2}')
-          USER=$(echo "$CREDS" | awk -F':' '{print $1}')
-          HOST=$(echo "$HOSTPORTPATHQS" | awk -F'[:/]' '{print $1}')
-          PORT=$(echo "$HOSTPORTPATHQS" | awk -F'[:/]' '{print $2}')
-          PORT=${PORT:-5432}
-          echo "DB host (masked): $HOST"
-          echo "DB port: $PORT"
-          if [ "$PORT" != "5432" ]; then
-            echo "::warning title=DB Port::Expected port 5432 for CI; detected $PORT"
-          fi
-          case "$HOST" in
-            *pooler.supabase.com)
-              echo "Pooler host detected (IPv4-friendly)."
-              if ! echo "$USER" | grep -Eq '^postgres\.[a-z0-9]{20}$'; then
-                echo "::warning title=DB Username::Pooler requires postgres.<PROJECT_REF>; current user: $USER"
-              fi
-              ;;
-            db.*.supabase.co)
-              echo "Direct host detected."
-              if ! echo "$USER" | grep -Eq '^postgres(\.[a-z0-9]{20})?$'; then
-                echo "::warning title=DB Username::Direct host expects postgres or postgres.<PROJECT_REF>; current user: $USER"
-              fi
-              ;;
-            *)
-              echo "::warning title=DB Host::Unknown host pattern: $HOST"
-              ;;
-          esac
-          if echo "$RAW" | grep -qi 'sslmode="require"'; then
-            echo "::warning title=sslmode::Invalid sslmode value \"require\" detected; will normalize."
-          fi
-          CLEAN=$(echo "$RAW" | awk -F'\\?' '{print $1}')
-          echo "db_url_clean=$CLEAN" >> "$GITHUB_OUTPUT"
-          echo "DB_URL_CLEAN=$CLEAN"  >> "$GITHUB_ENV"
-
-      # --- Routing integrity gate ---
-      - name: Routing integrity (no null tiles)
-        if: steps.dbnorm.outputs.no_db != '1'
-        run: |
-          set -euo pipefail
-          echo "Checking routing integrity..."
-          sudo apt-get update -y >/dev/null
-          sudo apt-get install -y postgresql-client >/dev/null
-          export PGSSLMODE=require
-          export PGCONNECT_TIMEOUT=10
-          if ! psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc "select 1;" >/dev/null 2>psql.err; then
-            echo "❌ Could not connect to Supabase (stderr follows):"
-            sed -n '1,200p' psql.err || true
-            exit 2
-          fi
-          echo "Connectivity OK."
-          COUNT=$(psql "$DB_URL_CLEAN" -v ON_ERROR_STOP=1 -Atc \
-            "select count(*) from postcode_routing_codes where tile_left is null or tile_right is null;")
-          echo "Null tile rows: $COUNT"
-          [ "$COUNT" -eq 0 ] || (echo "Routing holes exist. Import mappings before deploy."; exit 1)
-
-      # --- Preserve artifacts on failure for debugging ---
-      - name: Upload smoke artifacts (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: smoke-artifacts
-          path: |
-            a6.headers
-            a6.bin
-            a4.headers
-            a4.bin
-          if-no-files-found: ignore
+          if [ -z "${{ secrets.SUPABASE_DB_URL
 
 
 
