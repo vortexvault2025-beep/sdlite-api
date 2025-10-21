@@ -1,76 +1,67 @@
-name: Rollback API (symlink → previous/target release)
+name: Rollback API (symlink → previous/target)
 
 on:
   workflow_dispatch:
     inputs:
-      target_sha:
-        description: "Release SHA to roll back to (leave blank = previous good)"
+      to_release:
+        description: "Release SHA to roll back TO (empty = previous)"
         required: false
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: api-rollback
-  cancel-in-progress: false
+  group: api-rollback-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rollback:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - name: Roll back to previous/target release on VPS (no apt, no npm)
+      - name: Rollback on VPS
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host:     ${{ secrets.VPS_HOST }}
+          host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
+          key: ${{ secrets.VPS_SSH_KEY }}
           script_stop: true
-          envs: GITHUB_SHA
           script: |
             set -euo pipefail
+            trap 'ret=$?; echo "::error::Rollback failed on line ${LINENO} (exit=$ret)"; ss -lntp || true; pm2 ls || true; exit $ret' ERR
+            set -x
             BASE="${{ secrets.VPS_PATH }}"
             RELS="${BASE}/releases"
             CUR="${BASE}/current"
-            TARGET="${{ github.event.inputs.target_sha || '' }}"
+            WANT="${{ github.event.inputs.to_release }}"
+            test -d "$RELS"
 
-            CURRENT="$(readlink -f "$CUR" || true)"
-            if [ -n "$TARGET" ] && [ -d "${RELS}/${TARGET}" ]; then
-              CANDIDATE="${RELS}/${TARGET}"
+            if [ -n "$WANT" ]; then
+              TARGET="$RELS/$WANT"
+              [ -d "$TARGET" ] || { echo "Release $WANT not found under $RELS"; exit 2; }
             else
-              CANDIDATE="$(ls -1dt "${RELS}/"* 2>/dev/null | grep -vF "$CURRENT" | sed -n '1p' || true)"
+              CURRENT_REAL="$(readlink -f "$CUR" || true)"
+              TARGET="$(ls -1dt "${RELS}/"* 2>/dev/null | grep -v "^$CURRENT_REAL$" | head -1 || true)"
+              [ -n "$TARGET" ] || { echo "No previous release to roll back to."; exit 3; }
             fi
 
-            if [ -z "${CANDIDATE:-}" ] || [ ! -d "${CANDIDATE:-/missing}" ]; then
-              echo "❌ No rollback candidate found."; exit 1
-            fi
-
-            echo "↩️  Linking current → $CANDIDATE"
-            ln -sfn "$CANDIDATE" "$CUR"
-
+            echo "→ Rolling back to: $TARGET"
+            pm2 delete "${{ secrets.PM2_NAME }}" || true
+            ln -sfn "$TARGET" "$CUR"
             cd "$CUR"
-            sudo pm2 restart "${{ secrets.PM2_NAME }}" --update-env || \
-            sudo pm2 start "node src/server.js" --name "${{ secrets.PM2_NAME }}"
-            sudo pm2 save || true
+            DOTENV_CONFIG_PATH="${BASE}/.env" \
+            pm2 start "src/server.js" --name "${{ secrets.PM2_NAME }}" \
+              --interpreter node --interpreter-args "-r dotenv/config"
+            pm2 save || true
+            pm2 ls || true
 
-            PORT="${PORT:-}"
-            if [ -z "$PORT" ] && [ -f "${BASE}/.env" ]; then
-              PORT="$(grep -E '^PORT=' "${BASE}/.env" | tail -1 | cut -d= -f2 | tr -d '\r' || true)"
-            fi
+            # Readiness (200/401 ok)
             PORT="${PORT:-3000}"
-
-            echo "→ Checking http://127.0.0.1:${PORT}/healthz (200 or 401)"
-            ready=0
+            echo "Polling http://127.0.0.1:${PORT}/healthz ..."
             for i in $(seq 1 60); do
-              if command -v curl >/dev/null 2>&1; then
-                code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || true)"
-              else
-                code="$(wget -qO- --server-response "http://127.0.0.1:${PORT}/healthz" 2>&1 | awk '/^  HTTP/{print $2; exit}' || true)"
-              fi
-              code=${code:-000}
-              echo "healthz try #$i: HTTP $code"
-              if [ "$code" = "200" ] || [ "$code" = "401" ]; then ready=1; break; fi
+              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/healthz" || true)"
+              [ "$code" = "200" ] || [ "$code" = "401" ] && { echo "Ready (HTTP $code)"; exit 0; }
               sleep 1
             done
-            [ "$ready" -eq 1 ] || { echo "❌ Rollback target not ready"; exit 1; }
-            echo "✅ Rollback OK."
+            echo "Rollback readiness failed"; exit 4
