@@ -57,25 +57,26 @@ jobs:
 
       # --- Resolve public API base (vars → secrets → base_url) ---
       - name: Resolve API base URL (robust normalize)
-  run: |
-    set -euo pipefail
-    # Prefer repo var (visible), then secret host, then full base url secret.
-    RAW="${{ vars.API_HOST }}"
-    if [ -z "$RAW" ]; then RAW="${{ secrets.API_HOST }}"; fi
-    if [ -z "$RAW" ]; then RAW="${{ secrets.API_BASE_URL }}"; fi
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Prefer repo var (visible), then secret host, then full base url secret.
+          RAW="${{ vars.API_HOST }}"
+          if [ -z "$RAW" ]; then RAW="${{ secrets.API_HOST }}"; fi
+          if [ -z "$RAW" ]; then RAW="${{ secrets.API_BASE_URL }}"; fi
 
-    # Trim whitespace / CR, normalize scheme, remove trailing slash
-    RAW="$(printf '%s' "$RAW" | tr -d '\r' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-    if printf '%s' "$RAW" | grep -qiE '^https?://'; then
-      URL_BASE="$RAW"
-    else
-      URL_BASE="https://$RAW"
-    fi
-    URL_BASE="${URL_BASE%/}"
+          # Trim whitespace / CR, normalize scheme, remove trailing slash
+          RAW="$(printf '%s' "$RAW" | tr -d '\r' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+          if printf '%s' "$RAW" | grep -qiE '^https?://'; then
+            URL_BASE="$RAW"
+          else
+            URL_BASE="https://$RAW"
+          fi
+          URL_BASE="${URL_BASE%/}"
 
-    # Export for later steps (do not echo the value)
-    printf 'URL_BASE=%s\n' "$URL_BASE" >> "$GITHUB_ENV"
-    echo "API base normalized (masked)."
+          # Export for later steps (do not echo the value)
+          printf 'URL_BASE=%s\n' "$URL_BASE" >> "$GITHUB_ENV"
+          echo "API base normalized (masked)."
 
       # --- Ship code to VPS target path ---
       - name: Upload to VPS
