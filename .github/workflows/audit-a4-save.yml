@@ -1,0 +1,69 @@
+name: Audit A4 save (label_audit)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  audit-a4-save:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Resolve API base URL (robust normalize)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW="${{ vars.API_HOST }}"
+          if [ -z "$RAW" ]; then RAW="${{ secrets.API_HOST }}"; fi
+          if [ -z "$RAW" ]; then RAW="${{ secrets.API_BASE_URL }}"; fi
+          RAW="$(printf '%s' "$RAW" | tr -d '\r' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+          if printf '%s' "$RAW" | grep -qiE '^https?://'; then
+            URL_BASE="$RAW"
+          else
+            URL_BASE="https://$RAW"
+          fi
+          URL_BASE="${URL_BASE%/}"
+          echo "URL_BASE=$URL_BASE" >> "$GITHUB_ENV"
+          echo "API base normalized (masked)."
+
+      - name: Call A4 4-up with save=1 (masked)
+        shell: bash
+        env:
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+        run: |
+          set -euo pipefail
+          ORDER="ORD-CI-A4-$(date +%s)-${GITHUB_RUN_NUMBER:-0}"
+          echo "ORDER_ID=$ORDER" >> "$GITHUB_ENV"
+          URL="$URL_BASE/api/labels/render-a4-4up?count=2&save=1"
+          echo "→ POST /api/labels/render-a4-4up (ORDER=$ORDER)"
+          curl -sS -X POST "$URL" \
+            -H "X-Api-Key: $X_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data-binary "{\"variant\":\"a6_trk24_nosig_v1\",\"orderId\":\"$ORDER\",\"recipient\":{\"lines\":[\"A\",\"B\",\"C\",\"SW1A 1AA\"]}}" \
+            -D a4.headers -o a4.pdf -w "\nHTTP=%{http_code}\n"
+
+          head -c 5 a4.pdf | grep -q "%PDF-" || { echo "::error::Not a PDF"; exit 1; }
+          grep -qi '^content-type: *application/pdf' a4.headers || { echo "::error::Wrong Content-Type"; exit 1; }
+          grep -qi '^content-disposition: *attachment; *filename="RM-ORD-' a4.headers || { echo "::error::Wrong Content-Disposition"; exit 1; }
+          echo "Client-side checks OK."
+
+      - name: Verify label_audit row in Supabase (no secrets)
+        shell: bash
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y postgresql-client >/dev/null
+          DB_CLEAN="$(printf '%s' "$DB_URL" | tr -d '\r' | awk -F'\\?' '{print $1}')"
+          export PGSSLMODE=require
+          ORDER="$ORDER_ID"
+
+          COUNT="$(psql "$DB_CLEAN" -v ON_ERROR_STOP=1 -Atc "select count(*) from label_audit where order_id='${ORDER}';")"
+          echo "label_audit count for ${ORDER}: ${COUNT}"
+          test "${COUNT:-0}" -ge 1 || { echo "::error::No label_audit row inserted for ${ORDER}"; exit 1; }
+
+          echo "Audit OK: label_audit has a row for ${ORDER}"
